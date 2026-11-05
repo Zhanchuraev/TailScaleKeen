@@ -82,3 +82,8 @@ footer{max-width:none;font-size:11px;color:var(--muted);padding:0 32px 20px}.toa
 button.copy-address{border:0;border-radius:2px;background:transparent;color:var(--blue);padding:4px;width:24px;min-width:24px;height:24px;min-height:24px;line-height:1;flex:none}
 button.copy-address .icon{width:14px;height:16px;stroke-width:1.4;stroke-linecap:square;stroke-linejoin:miter}
 button.copy-address:hover{background:color-mix(in srgb,var(--blue) 9%,var(--bg))}
+
+.address-stack{display:inline-flex;flex-direction:column;align-items:flex-start}
+.address-line.secondary{color:var(--muted);font-size:12px;line-height:18px}
+.address-line.secondary button.copy-address{width:20px;min-width:20px;height:18px;min-height:18px;padding:1px 3px}
+.address-line.secondary button.copy-address .icon{width:12px;height:14px}

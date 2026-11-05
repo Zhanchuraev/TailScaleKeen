@@ -27,9 +27,12 @@ function goodBadge(online){return `<span class="state-dot ${online?'online':''}"
 function health(){return data.tailscale.health.map(x=>`<div class="alert">${E(x)}</div>`).join('')}
 function jobRows(){return (data.jobs||[]).slice(0,5).map(j=>`<li><button class="job-link" data-job="${E(j.id)}">${E(j.label)}</button><span class="muted">${j.state==='done'?'Готово':j.state==='error'?'Ошибка':j.state==='interrupted'?'Прервано':'Выполняется'}</span></li>`).join('')||'<li class="muted">Операций пока нет</li>'}
 function addressCell(peer){
- const ip=address(peer);if(!ip||ip==='—')return E(ip||'—');
- return `<span class="address-line"><span>${E(ip)}</span><button type="button" class="copy-address" data-copy-address="${E(ip)}" aria-label="Скопировать IP-адрес ${E(ip)}" title="Скопировать IP-адрес">${icon('copy')}</button></span>`
+ const addresses=(peer?.TailscaleIPs||[]).filter(ip=>typeof ip==='string'&&ip);
+ const ipv4=addresses.find(ip=>!ip.includes(':')),ipv6=addresses.find(ip=>ip.includes(':'));
+ const row=(ip,secondary=false)=>`<span class="address-line${secondary?' secondary':''}"><span>${E(ip)}</span><button type="button" class="copy-address" data-copy-address="${E(ip)}" aria-label="Скопировать IP-адрес ${E(ip)}" title="Скопировать IP-адрес">${icon('copy')}</button></span>`;
+ return ipv4||ipv6?`<span class="address-stack">${ipv4?row(ipv4):''}${ipv6?row(ipv6,Boolean(ipv4)):''}</span>`:'—'
 }
+
 function legacyCopyAddress(text,button){
  const node=button.previousElementSibling,selection=window.getSelection();
  if(!node||node.textContent!==text||!selection)throw Error('Clipboard unavailable');
