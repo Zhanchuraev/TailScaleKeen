@@ -1,0 +1,47 @@
+#!/bin/sh
+PATH=/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin
+export PATH PYTHONDONTWRITEBYTECODE=1
+APP=/opt/share/tailscale-panel
+PID=/opt/var/run/tailscale-panel.pid
+LOG=/opt/var/log/tailscale-panel.log
+alive() {
+    [ -f "$PID" ] && [ ! -L "$PID" ] || return 1
+    read -r panel_pid < "$PID"
+    case "$panel_pid" in ''|*[!0-9]*) return 1;; esac
+    [ -r "/proc/$panel_pid/cmdline" ] || return 1
+    tr '\000' ' ' < "/proc/$panel_pid/cmdline" | grep -q 'python3 -m panel.server' || return 1
+    kill -0 "$panel_pid" 2>/dev/null
+}
+start() {
+    alive && return 0
+    mkdir -p /opt/var/run /opt/var/log
+    umask 077
+    [ -L "$PID" ] && return 1
+    [ -L "$LOG" ] && return 1
+    [ ! -f "$LOG" ] || { [ "$(wc -c < "$LOG")" -lt 1048576 ] || mv "$LOG" "$LOG.1"; }
+    cd "$APP" || return 1
+    nohup /opt/bin/python3 -m panel.server --state /opt/etc/tailscale-panel >> "$LOG" 2>&1 < /dev/null &
+    panel_pid=$!
+    printf '%s\n' "$panel_pid" > "$PID"
+    sleep 1
+    alive || { rm -f "$PID"; return 1; }
+    echo "TailScaleKeen started"
+}
+stop() {
+    if ! alive; then rm -f "$PID"; return 0; fi
+    kill -TERM "$panel_pid" || return 1
+    count=0
+    while kill -0 "$panel_pid" 2>/dev/null; do
+        count=$((count+1))
+        [ "$count" -lt 240 ] || { echo "A client operation is still active; panel was not killed" >&2; return 1; }
+        sleep 1
+    done
+    rm -f "$PID"
+}
+case "${1:-status}" in
+    start) start;;
+    stop) stop;;
+    restart) stop && start;;
+    status) if alive; then echo "running $panel_pid"; else echo stopped; exit 1; fi;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1;;
+esac
