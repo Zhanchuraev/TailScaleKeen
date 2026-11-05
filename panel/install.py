@@ -10,6 +10,14 @@ def at(root, path):
     return pathlib.Path(root) / path.lstrip("/")
 
 
+def require_space(root, megabytes):
+    folder = at(root, "/opt")
+    if not folder.exists():
+        folder = pathlib.Path(root)
+    if shutil.disk_usage(folder).free < megabytes * 1024 * 1024:
+        raise Error("Недостаточно места в Entware: требуется не менее " + str(megabytes) + " МБ")
+
+
 def install_launchers(root, source):
     for command in ["tailscalekeen", "tailscale-panel"]:
         wrapper = at(root, "/opt/bin/" + command)
@@ -42,7 +50,7 @@ def detect_tun(config):
     if processes:
         args, exe = processes[0]
         detected = next((x.split("=", 1)[1] for x in args if x.startswith("--tun=")), None)
-        if exe != "/opt/bin/tailscaled" or not init.is_file() or not detected:
+        if pathlib.Path(exe).resolve() != pathlib.Path("/opt/bin/tailscaled").resolve() or not init.is_file() or not detected:
             raise Error("Существующий клиент использует неподдерживаемую схему запуска; файлы не заменены")
     elif init.is_file():
         match = re.search(r"--tun=(opkgtun\d+)", init.read_text())
@@ -93,7 +101,8 @@ def client(root, archive_path=None):
         p = subprocess.run(
             [str(current), "version"], capture_output=True, text=True, timeout=15
         )
-        if p.returncode == 0 and p.stdout.splitlines()[0] == v:
+        daemon = subprocess.run([str(target / "tailscaled"), "--version"], capture_output=True, text=True, timeout=15)
+        if p.returncode == 0 and p.stdout.splitlines()[:1] == [v] and daemon.returncode == 0 and daemon.stdout.splitlines()[:1] == [v]:
             return {"version": v, "changed": False}
     if root == "/" and current.exists():
         # Reuse the same transactional updater as the panel, keeping an existing state/identity.
@@ -105,8 +114,9 @@ def client(root, archive_path=None):
         runner = Runner()
         ts = Tailscale(runner)
         return Updater(state, ts, Native(state, runner), runner).update(
-            lambda x: print(x, flush=True)
+            lambda x: print(x, flush=True), force=True
         )
+    require_space(root, 240)
     blob = pathlib.Path(archive_path).read_bytes() if archive_path else download(TS_BASE + name)
     h = hashlib.sha256(blob).hexdigest()
     checksum = download(TS_BASE + name + ".sha256", 8192).decode().strip()
@@ -152,6 +162,7 @@ def _install(
         raise Error("Требуется Entware aarch64-k3.10")
     if not 1024 <= port <= 65535:
         raise Error("Порт должен быть в диапазоне 1024–65535")
+    require_space(root, 64)
     if root == "/" and not (state / "config.json").exists():
         with socket.socket() as s:
             s.bind(("0.0.0.0", port))

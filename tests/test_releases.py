@@ -26,6 +26,11 @@ class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=pathlib.Path(self.tmp.name)
 
+    def test_isolated_server_cannot_launch_production_self_update(self):
+        with patch('panel.panel_update.release_info') as fetch, self.assertRaises(Error):
+            PanelUpdater(self.root).prepare(lambda _:None)
+        self.assertFalse(fetch.called)
+
     def test_valid_archive_and_reproducible_build(self):
         path=build();one=path.read_bytes();self.assertEqual(one,build().read_bytes())
         m=unpack_release(one,self.root/'candidate',VERSION)

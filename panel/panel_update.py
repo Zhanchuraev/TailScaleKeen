@@ -52,7 +52,7 @@ class PanelUpdater:
         return self.cache
 
     def prepare(self, log, version=None):
-        if self.state.resolve() != pathlib.Path("/opt/etc/tailscale-panel"):
+        if self.state.resolve() != pathlib.Path("/opt/etc/tailscale-panel").resolve():
             raise Error("Самообновление доступно только для установленной панели в штатном каталоге")
         if self.active():
             raise Error("Обновление панели уже запущено", 409)
@@ -222,7 +222,7 @@ def main():
     if os.geteuid() != 0:
         raise Error("Нужны права root")
     state = pathlib.Path(args.state)
-    if state.resolve() != pathlib.Path("/opt/etc/tailscale-panel"):
+    if state.resolve() != pathlib.Path("/opt/etc/tailscale-panel").resolve():
         raise Error("Обновление вне штатного каталога запрещено")
     token = read_json(state / "panel-update/transaction.json").get("token")
     if not isinstance(token, str) or len(token) != 32:

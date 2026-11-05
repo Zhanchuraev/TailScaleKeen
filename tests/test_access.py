@@ -283,6 +283,21 @@ class InstallerAccountTests(unittest.TestCase):
         ), contextlib.redirect_stdout(io.StringIO()):
             return _install(self.source, root=str(self.root), **kwargs)
 
+    def test_low_space_stops_before_writing_panel_or_account(self):
+        from types import SimpleNamespace
+        with patch("panel.install.shutil.disk_usage", return_value=SimpleNamespace(free=1024)), self.assertRaises(Error):
+            self.install()
+        self.assertFalse((self.root / "opt/share/tailscale-panel").exists())
+        self.assertFalse((self.state / "auth.json").exists())
+
+    def test_low_space_client_stops_before_downloading_archive(self):
+        from types import SimpleNamespace
+        catalog = {"TarballsVersion": "1.104.5", "Tarballs": {"arm64": "tailscale_1.104.5_arm64.tgz"}}
+        with patch("panel.install.download", return_value=json.dumps(catalog).encode()) as fetch, patch("panel.install.shutil.disk_usage", return_value=SimpleNamespace(free=1024)), self.assertRaises(Error):
+            installer_module.client(str(self.root))
+        self.assertEqual(fetch.call_count, 1)
+        self.assertFalse((self.root / "opt/bin/tailscaled").exists())
+
     def test_clean_install_creates_setup_and_reinstall_preserves_account(self):
         self.install()
         self.assertFalse((self.state / "setup.token").exists())
