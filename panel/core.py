@@ -3,7 +3,7 @@
 from __future__ import annotations
 import contextlib, hashlib, ipaddress, json, os, pathlib, re, secrets, shlex, subprocess, threading, time, urllib.parse, urllib.request
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 PREF_KEYS = (
     "ControlURL",
     "RouteAll",

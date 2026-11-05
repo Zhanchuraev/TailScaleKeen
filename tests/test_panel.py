@@ -83,6 +83,8 @@ class FakeRunner:
                 out = "1.104.5\n"
             else:
                 out = ""
+        elif args[0].endswith("tailscaled") and args[1:] == ["--version"]:
+            out = "1.104.5\n"
         elif args[:2] == ["ndmc", "-c"]:
             out = self.native
         else:
@@ -502,6 +504,34 @@ class AuthHTTPTests(unittest.TestCase):
 
 
 class PurgeTests(unittest.TestCase):
+    def test_client_check_detects_old_running_daemon_with_current_cli(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = FakeRunner()
+            ts = Tailscale(runner)
+            updater = Updater(d, ts, Native(d, runner), runner)
+            catalog = {"TarballsVersion": "1.104.5", "Tarballs": {"arm64": "tailscale_1.104.5_arm64.tgz"}}
+            with patch("panel.updates.download", return_value=json.dumps(catalog).encode()):
+                self.assertFalse(updater.check()["available"])
+                runner.status["Version"] = "1.104.4-test"
+                ts.invalidate()
+                self.assertTrue(updater.check()["available"])
+
+    def test_client_check_detects_old_daemon_file_with_current_process(self):
+        with tempfile.TemporaryDirectory() as d:
+            runner = FakeRunner()
+            original = runner.run
+            def run(args, **kwargs):
+                if args == ["/opt/bin/tailscaled", "--version"]:
+                    return subprocess.CompletedProcess(args, 0, "1.104.4\n", "")
+                return original(args, **kwargs)
+            runner.run = run
+            updater = Updater(d, Tailscale(runner), Native(d, runner), runner)
+            catalog = {"TarballsVersion": "1.104.5", "Tarballs": {"arm64": "tailscale_1.104.5_arm64.tgz"}}
+            with patch("panel.updates.download", return_value=json.dumps(catalog).encode()):
+                info = updater.check()
+                self.assertTrue(info["available"])
+                self.assertEqual(info["daemon_file"], "1.104.4")
+
     def test_purge_removes_owned_state_and_keeps_other_apps(self):
         with tempfile.TemporaryDirectory() as d:
             root = pathlib.Path(d)

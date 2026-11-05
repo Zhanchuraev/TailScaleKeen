@@ -22,10 +22,21 @@ class Updater:
             raise Error("Неожиданный формат официального каталога Tailscale")
         current = self.ts.run("version", check=False).stdout.splitlines()
         current = current[0] if current else ""
+        try:
+            value = self.runner.run(["/opt/bin/tailscaled", "--version"], check=False).stdout.splitlines()
+            daemon_file = value[0].split("-")[0] if value else ""
+        except Error:
+            daemon_file = ""
+        try:
+            daemon_running = self.ts.snapshot().get("version", "").split("-")[0]
+        except Error:
+            daemon_running = ""
         return {
             "current": current,
             "latest": version,
-            "available": current != version,
+            "available": current != version or daemon_file != version or bool(daemon_running and daemon_running != version),
+            "daemon_file": daemon_file,
+            "daemon_running": daemon_running,
             "archive": archive,
             "source": BASE,
             "checked_at": int(time.time()),
