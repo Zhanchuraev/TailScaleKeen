@@ -3,7 +3,7 @@
 from __future__ import annotations
 import contextlib, hashlib, ipaddress, json, os, pathlib, re, secrets, shlex, subprocess, threading, time, urllib.parse, urllib.request
 
-VERSION = "1.0.2"
+VERSION = "1.1.0"
 PREF_KEYS = (
     "ControlURL",
     "RouteAll",
@@ -389,17 +389,21 @@ class Jobs:
     def start(self, label, fn):
         if not self.lock.acquire(False):
             raise Error("Другая операция ещё выполняется", 409)
-        self.prune()
-        jid = secrets.token_hex(12)
-        p = self.path / (jid + ".json")
-        record = {
-            "id": jid,
-            "label": label,
-            "state": "running",
-            "started_at": time.time(),
-            "log": [],
-        }
-        write_json(p, record)
+        try:
+            self.prune()
+            jid = secrets.token_hex(12)
+            p = self.path / (jid + ".json")
+            record = {
+                "id": jid,
+                "label": label,
+                "state": "running",
+                "started_at": time.time(),
+                "log": [],
+            }
+            write_json(p, record)
+        except Exception:
+            self.lock.release()
+            raise
 
         def worker():
             try:
@@ -419,10 +423,21 @@ class Jobs:
                 record["error"] = scrub(e)
             finally:
                 record["finished_at"] = time.time()
-                write_json(p, record)
-                self.lock.release()
+                try:
+                    write_json(p, record)
+                finally:
+                    self.lock.release()
 
-        threading.Thread(target=worker, name="tailscale-panel-job", daemon=True).start()
+        try:
+            threading.Thread(target=worker, name="tailscale-panel-job", daemon=True).start()
+        except Exception:
+            try:
+                record.update(state="error", error="Не удалось запустить операцию. Проверьте состояние перед повтором.", finished_at=time.time())
+                with contextlib.suppress(OSError):
+                    write_json(p, record)
+            finally:
+                self.lock.release()
+            raise
         return record
 
 

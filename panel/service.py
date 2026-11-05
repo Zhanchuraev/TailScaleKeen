@@ -1,4 +1,4 @@
-import copy, hashlib, ipaddress, json, os, pathlib, platform, re, secrets, subprocess, time
+import copy, hashlib, ipaddress, json, os, pathlib, platform, re, secrets, subprocess, threading, time
 from .core import (
     Error,
     Jobs,
@@ -36,6 +36,11 @@ class Service:
         self.integration = Integration(self.state, self.runner, self.native.tun)
         self.devices = Devices(self.state, self.ts)
         self.plans = {}
+        self.plans_lock = threading.RLock()
+        self.audit_lock = threading.Lock()
+        self.health_lock = threading.Lock()
+        self.health_cached = None
+        self.health_at = 0
         self.audit = self.state / "audit.jsonl"
 
     def maintain_policies(self):
@@ -71,17 +76,45 @@ class Service:
             self.jobs.lock.release()
 
     def event(self, event, details=None):
-        if self.audit.exists() and self.audit.stat().st_size > 512 * 1024:
-            self.audit.replace(self.state / "audit.previous.jsonl")
-        with self.audit.open("a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {"at": int(time.time()), "event": event, "details": details or {}},
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        self.audit.chmod(0o600)
+        with self.audit_lock:
+            if self.audit.exists() and self.audit.stat().st_size > 512 * 1024:
+                self.audit.replace(self.state / "audit.previous.jsonl")
+            fd = os.open(self.audit, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                os.chmod(self.audit, 0o600)
+                f.write(json.dumps({"at": int(time.time()), "event": event,
+                                   "details": details or {}}, ensure_ascii=False) + "\n")
+
+    def health(self):
+        from .health import inspect
+        with self.health_lock:
+            if self.health_cached is None or time.monotonic() - self.health_at > 5:
+                self.health_cached = inspect(self)
+                self.health_at = time.monotonic()
+            return self.health_cached
+
+    def prune_plans(self):
+        with self.plans_lock:
+            for key, item in list(self.plans.items()):
+                if item["expires"] <= time.time():
+                    item.get("params", {}).pop("auth_key", None)
+                    self.plans.pop(key, None)
+
+    def remember_plan(self, ident, record):
+        with self.plans_lock:
+            self.prune_plans()
+            if len(self.plans) >= 32:
+                raise Error("Слишком много ожидающих изменений. Закройте лишние окна или подождите три минуты.", 429)
+            self.plans[ident] = record
+
+    def cancel_plan(self, ident):
+        if not isinstance(ident, str) or not re.fullmatch(r"[a-f0-9]{32}", ident):
+            raise Error("Неверный предварительный просмотр")
+        with self.plans_lock:
+            item = self.plans.pop(ident, None)
+            if item:
+                item.get("params", {}).pop("auth_key", None)
+        return {"ok": True}
 
     def dashboard(self):
         try:
@@ -149,7 +182,7 @@ class Service:
             raise Error("Параметры должны быть объектом")
         if self.panel_updater.active():
             raise Error("Панель обновляется. Дождитесь завершения и войдите снова.", 409)
-        self.plans = {k: v for k, v in self.plans.items() if v["expires"] > time.time()}
+        self.prune_plans()
         if action == "update_panel":
             if params:
                 raise Error("Это действие не принимает параметров")
@@ -157,7 +190,7 @@ class Service:
             if not info["available"]:
                 raise Error("Установлена актуальная версия панели")
             pid = secrets.token_hex(16)
-            self.plans[pid] = {"action": action, "params": {"version": info["latest"]}, "expires": time.time() + 180}
+            self.remember_plan(pid, {"action": action, "params": {"version": info["latest"]}, "expires": time.time() + 180})
             return {"id": pid, "action": action, "changes": [{"name": "TailScaleKeen", "before": VERSION, "after": info["latest"]}],
                     "commands": [], "message": "Код панели будет загружен из официального репозитория проекта и проверен. Панель перезапустится; войдите снова. Клиент Tailscale и его настройки сохранятся.", "expires_in": 180}
         changes = []
@@ -166,7 +199,7 @@ class Service:
         native_revision = None
         egress_revision = None
         s = self.ts.snapshot(True)
-        revision = self.ts.revision()
+        revision = hashlib.sha256(json.dumps(s["prefs"], sort_keys=True).encode()).hexdigest()
         if action == "settings":
             args, changes = self.ts.set_args(params)
             commands = [["tailscale", "set", *args]] if args else []
@@ -262,14 +295,14 @@ class Service:
         else:
             raise Error("Неизвестное действие")
         pid = secrets.token_hex(16)
-        self.plans[pid] = {
+        self.remember_plan(pid, {
             "action": action,
             "params": copy.deepcopy(params),
             "revision": revision,
             "native_revision": native_revision,
             "egress_revision": egress_revision,
             "expires": time.time() + 180,
-        }
+        })
         return {
             "id": pid,
             "action": action,
@@ -282,7 +315,8 @@ class Service:
     def apply(self, pid):
         if not isinstance(pid, str) or not re.fullmatch(r"[a-f0-9]{32}", pid):
             raise Error("Не найден предварительный просмотр", 404)
-        plan = self.plans.pop(pid, None)
+        with self.plans_lock:
+            plan = self.plans.pop(pid, None)
         if not plan or plan["expires"] < time.time():
             raise Error(
                 "Предварительный просмотр истёк. Проверьте изменения ещё раз.", 409
@@ -311,6 +345,16 @@ class Service:
                 raise Error("Настройки роутера изменились после просмотра", 409)
 
         def work(log):
+            # Jobs owns operation_lock here: recheck after acquiring it, not just
+            # in the HTTP thread before the worker was scheduled.
+            if action != "update_panel" and self.ts.revision() != plan["revision"]:
+                raise Error("Настройки изменились перед выполнением. Сформируйте новый план.", 409)
+            if action == "egress" and self.egress.plan(params)["revision"] != plan.get("egress_revision"):
+                raise Error("Выход изменился перед выполнением. Сформируйте новый план.", 409)
+            if action == "native_create" and plan.get("native_revision"):
+                from .native import normalize
+                if hashlib.sha256(normalize(self.native.cli("show running-config")).encode()).hexdigest() != plan["native_revision"]:
+                    raise Error("Настройки роутера изменились перед выполнением. Сформируйте новый план.", 409)
             self.event("action_started", {"action": action})
             policies = [] if action == "update_panel" else self.native.linked_policies()
             if action == "update_panel":
@@ -503,13 +547,13 @@ class Service:
         if kind == "netcheck":
             args = ["/opt/bin/tailscale", "netcheck"]
             timeout = 40
-        elif kind == "ping":
+        elif kind in ["ping", "tsmp"]:
             allowed = {
                 ip
                 for p in self.ts.snapshot(True)["peers"]
                 for ip in (p["TailscaleIPs"] or [])
             }
-            if target not in allowed:
+            if not isinstance(target, str) or target not in allowed:
                 raise Error("Выберите известный узел сети")
             args = [
                 "/opt/bin/tailscale",
@@ -519,6 +563,8 @@ class Service:
                 "--until-direct=false",
                 target,
             ]
+            if kind == "tsmp":
+                args.insert(2, "--tsmp")
             timeout = 25
         elif kind == "routes":
             args = ["ip", "-4", "rule", "show"]

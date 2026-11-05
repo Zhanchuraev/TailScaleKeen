@@ -50,8 +50,11 @@ class App:
             self.sessions = {
                 k: v for k, v in self.sessions.items() if v["expires"] > time.time()
             }
-            if len(self.sessions) > 128:
-                self.sessions.pop(next(iter(self.sessions)))
+            # Public session discovery must never evict a signed-in administrator.
+            peers = [k for k, v in self.sessions.items() if bool(v["user"]) == bool(user)]
+            limit = 128 if user else 64
+            for key in peers[:max(0, len(peers) - limit + 1)]:
+                self.sessions.pop(key, None)
             token = secrets.token_urlsafe(32)
             record = {
                 "auth_revision": self.accounts.revision(),
@@ -68,7 +71,12 @@ class App:
             if epoch != self.failure_epoch:
                 self.failures.clear()
                 self.failure_epoch = epoch
-            self.failures[ip] = [t for t in self.failures[ip] if time.time() - t < 300]
+            self.failures = collections.defaultdict(list, {
+                key: [t for t in values if time.time() - t < 300]
+                for key, values in self.failures.items() if any(time.time() - t < 300 for t in values)
+            })
+            if ip not in self.failures and len(self.failures) >= 512:
+                raise Error("Вход временно занят. Повторите через несколько минут.", 429)
             if len(self.failures[ip]) >= 10:
                 raise Error("Слишком много попыток. Повторите через 5 минут.", 429)
         if not self.login_lock.acquire(False):
@@ -149,15 +157,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         content_type="application/json; charset=utf-8",
         cookie=None,
         download=None,
+        etag=None,
     ):
         if isinstance(data, (dict, list)):
             data = json.dumps(data, ensure_ascii=False).encode()
         elif isinstance(data, str):
             data = data.encode()
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        if status != 304:
+            self.send_header("Content-Type", content_type)
+        if status != 304:
+            self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=0, must-revalidate" if etag else "no-store")
+        if etag:
+            self.send_header("ETag", etag)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("X-Frame-Options", "DENY")
@@ -253,8 +266,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ]:
                     raise Error("Файл не найден", 404)
                 p = self.server.web / relative
+                content = p.read_bytes()
+                etag = '"' + hashlib.sha256(content).hexdigest() + '"'
+                if etag in [x.strip() for x in self.headers.get("If-None-Match", "").split(",")]:
+                    self.send(304, b"", etag=etag)
+                    return
                 mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-                self.send(200, p.read_bytes(), mime + "; charset=utf-8")
+                self.send(200, content, mime + "; charset=utf-8", etag=etag)
                 return
             if path == "/api/session":
                 token, s = self.current()
@@ -279,6 +297,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             service = self.app.service
             if path == "/api/dashboard":
                 data = service.dashboard()
+            elif path in ["/api/health", "/api/support-report"]:
+                data = service.health()
+                if path == "/api/support-report":
+                    self.send(200, data, download="tailscalekeen-support.json")
+                    return
             elif path == "/api/native":
                 data = service.native.status()
             elif path == "/api/egress":
@@ -386,6 +409,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = service.plan(data.get("action", ""), data.get("params", {}))
             elif path == "/api/actions/apply":
                 result = service.apply(data.get("plan_id", ""))
+            elif path == "/api/actions/cancel":
+                result = service.cancel_plan(data.get("plan_id", ""))
             elif path == "/api/diagnostics":
                 result = service.diagnostics(
                     data.get("kind", ""), data.get("target", "")
@@ -514,6 +539,7 @@ def main():
         last_error = None
         while not stopped.wait(20):
             try:
+                app.service.prune_plans()
                 app.service.maintain_policies()
                 app.service.panel_updater.recover()
                 app.service.maintain_egress()
