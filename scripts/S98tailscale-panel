@@ -20,6 +20,9 @@ start() {
     [ -L "$LOG" ] && return 1
     [ ! -f "$LOG" ] || { [ "$(wc -c < "$LOG")" -lt 1048576 ] || mv "$LOG" "$LOG.1"; }
     cd "$APP" || return 1
+    if [ -x /opt/etc/ndm/netfilter.d/94-tailscalekeen-lan.sh ]; then
+        /opt/etc/ndm/netfilter.d/94-tailscalekeen-lan.sh
+    fi
     nohup /opt/bin/python3 -m panel.server --state /opt/etc/tailscale-panel >> "$LOG" 2>&1 < /dev/null &
     panel_pid=$!
     printf '%s\n' "$panel_pid" > "$PID"

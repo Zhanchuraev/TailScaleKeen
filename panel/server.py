@@ -543,6 +543,7 @@ def main():
                 app.service.maintain_policies()
                 app.service.panel_updater.recover()
                 app.service.maintain_egress()
+                app.service.maintain_lan_access()
                 last_error = None
             except Exception as exc:
                 # Never log response bodies or preference secrets.

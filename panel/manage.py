@@ -15,10 +15,10 @@ def main():
     sub.add_parser("reset-password")
     sub.add_parser("check-update")
     sub.add_parser("update")
-    for name in ["start", "stop", "restart", "status", "doctor", "egress-sync", "integration-sync"]:
+    for name in ["start", "stop", "restart", "status", "doctor", "egress-sync", "integration-sync", "lan-access-sync"]:
         sub.add_parser(name)
     a = p.parse_args()
-    if a.command in ["reset-password", "update", "egress", "egress-sync", "integration-sync", "start", "stop", "restart"] and getattr(os, "geteuid", lambda: -1)() != 0:
+    if a.command in ["reset-password", "update", "egress", "egress-sync", "integration-sync", "lan-access-sync", "start", "stop", "restart"] and getattr(os, "geteuid", lambda: -1)() != 0:
         raise Error("Выполните команду от root через SSH", 403)
     if a.command in ["check-update", "update"]:
         from .panel_update import PanelUpdater
@@ -62,7 +62,7 @@ def main():
             )
         print(json.dumps(purger.purge(), ensure_ascii=False, indent=2))
         return
-    if a.command in ["egress-sync", "egress", "integration-sync"]:
+    if a.command in ["egress-sync", "egress", "integration-sync", "lan-access-sync"]:
         from .service import Service
         from .core import operation_lock
 
@@ -79,6 +79,8 @@ def main():
                 print(json.dumps(result, ensure_ascii=False))
             elif a.command == "egress-sync":
                 s.egress.sync()
+            elif a.command == "lan-access-sync":
+                s.lan_access.sync()
             else:
                 s.integration.sync(s.ts.snapshot(True))
         return

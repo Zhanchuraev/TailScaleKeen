@@ -3,7 +3,7 @@
 from __future__ import annotations
 import contextlib, hashlib, ipaddress, json, os, pathlib, re, secrets, shlex, subprocess, threading, time, urllib.parse, urllib.request
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 PREF_KEYS = (
     "ControlURL",
     "RouteAll",
@@ -61,7 +61,7 @@ class Error(Exception):
 
 
 class Runner:
-    def run(self, args, timeout=20, check=True):
+    def run(self, args, timeout=20, check=True, input_text=None):
         env = {
             **os.environ,
             "PATH": "/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -74,7 +74,7 @@ class Runner:
                 text=True,
                 timeout=timeout,
                 env=env,
-                stdin=subprocess.DEVNULL,
+                **({"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}),
             )
         except subprocess.TimeoutExpired:
             raise Error(

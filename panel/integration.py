@@ -24,9 +24,11 @@ class Integration:
 
     def prefixes(self,snapshot,family):
         allowed=set()
+        access=read_json(self.state/'lan-access.json')
+        accept_for_lan=access.get('mode') in ('selected','all') and not access.get('restore_accept_routes')
         for peer in [snapshot.get('self',{}),*snapshot.get('peers',[])]:
             values=list(peer.get('TailscaleIPs') or [])
-            if snapshot.get('prefs',{}).get('RouteAll'):
+            if snapshot.get('prefs',{}).get('RouteAll') and not accept_for_lan:
                 values+=list(peer.get('PrimaryRoutes') or [])+list(peer.get('AllowedIPs') or [])
             for value in values:
                 try:

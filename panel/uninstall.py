@@ -311,6 +311,8 @@ class Purger:
             Egress(self.state, self.runner, self.tun).remove()
             from .integration import Integration
             Integration(self.state, self.runner, self.tun).remove()
+            from .lan_access import LanAccess
+            LanAccess(self.state, self.runner, None, self.tun).remove()
             # Stop only the client here; manage.py stops the separate panel before this process.
             init = self.path("/opt/etc/init.d/S06tailscaled")
             if init.exists():

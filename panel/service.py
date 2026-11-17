@@ -15,6 +15,7 @@ from .native import Native
 from .updates import Updater
 from .egress import Egress
 from .devices import Devices
+from .lan_access import LanAccess
 
 
 class Service:
@@ -35,6 +36,7 @@ class Service:
         from .integration import Integration
         self.integration = Integration(self.state, self.runner, self.native.tun)
         self.devices = Devices(self.state, self.ts)
+        self.lan_access = LanAccess(self.state, self.runner, self.ts, self.native.tun)
         self.plans = {}
         self.plans_lock = threading.RLock()
         self.audit_lock = threading.Lock()
@@ -72,6 +74,15 @@ class Service:
         try:
             with operation_lock(self.state):
                 self.egress.sync()
+        finally:
+            self.jobs.lock.release()
+
+    def maintain_lan_access(self):
+        if self.lan_access.current()["mode"] == "off" or not self.jobs.lock.acquire(False):
+            return
+        try:
+            with operation_lock(self.state):
+                self.lan_access.recover()
         finally:
             self.jobs.lock.release()
 
@@ -135,6 +146,7 @@ class Service:
             "panel_version": VERSION,
             "tailscale": s,
             "devices": self.devices.list(s),
+            "lan_access": self.lan_access.current(),
             "jobs": self.jobs.list()[:8],
             "metrics": self.metrics(s),
             "system": {
@@ -198,9 +210,24 @@ class Service:
         message = ""
         native_revision = None
         egress_revision = None
+        lan_revision = None
         s = self.ts.snapshot(True)
         revision = hashlib.sha256(json.dumps(s["prefs"], sort_keys=True).encode()).hexdigest()
-        if action == "settings":
+        if action == "lan_access":
+            existing = self.lan_access.current()
+            wanted = self.lan_access.plan(params, s)
+            lan_revision = existing
+            changes = [
+                {"name": "Доступ из LAN", "before": existing["mode"], "after": wanted["mode"]},
+                {"name": "Устройства", "before": existing["devices"], "after": wanted["devices"]},
+                {"name": "Подсети", "before": existing["subnets"], "after": wanted["subnets"]},
+            ]
+            message = "Правила действуют для указанного LAN-интерфейса. В режиме выбора остальные устройства этого сегмента не смогут обращаться к указанным подсетям через роутер."
+        elif action == "settings":
+            if self.lan_access.current()["mode"] != "off" and (
+                params.get("accept_routes") is False or params.get("exit_node")
+            ):
+                raise Error("Сначала отключите политику доступа из LAN")
             args, changes = self.ts.set_args(params)
             commands = [["tailscale", "set", *args]] if args else []
             message = (
@@ -301,6 +328,7 @@ class Service:
             "revision": revision,
             "native_revision": native_revision,
             "egress_revision": egress_revision,
+            "lan_revision": lan_revision,
             "expires": time.time() + 180,
         })
         return {
@@ -359,6 +387,10 @@ class Service:
             policies = [] if action == "update_panel" else self.native.linked_policies()
             if action == "update_panel":
                 result = self.panel_updater.prepare(log, params["version"])
+            elif action == "lan_access":
+                if self.lan_access.current() != plan.get("lan_revision"):
+                    raise Error("Список доступа изменился. Обновите предпросмотр.", 409)
+                result = self.lan_access.change(params, log)
             elif action == "settings":
                 result = self.ts.apply_settings(params, log)
                 self.native.sync_policies(
@@ -410,6 +442,7 @@ class Service:
             {
                 "settings": "Настройки клиента",
                 "egress": "Выход для клиентов Exit node",
+                "lan_access": "Доступ локальных устройств",
                 "native_create": "Подключение Keenetic",
                 "connect": "Подключение к сети",
                 "disconnect": "Отключение клиента",
