@@ -11,6 +11,7 @@ HOOK = Path("/opt/etc/ndm/netfilter.d/94-tailscalekeen-lan.sh")
 HOOK_TEXT = "#!/bin/sh\n/opt/bin/tailscalekeen lan-access-sync >/dev/null 2>&1\n"
 PRIORITY = "67"
 MGMT_PRIORITY = "66"
+BRIDGE = re.compile(r"br[0-9]{1,3}")
 TABLES = {
     "mangle": ("PREROUTING", "TSKL_PRE", "TSKL_PRE_ACCESS"),
     "filter": ("FORWARD", "TSKL_FWD", "TSKL_FWD_ACCESS"),
@@ -26,18 +27,29 @@ class LanAccess:
     def current(self):
         return read_json(self.path, {"mode": "off", "bridge": "br0", "devices": [], "subnets": []})
 
+    @staticmethod
+    def bridges(config):
+        return config["bridges"] if "bridges" in config else [config["bridge"]]
+
+    @staticmethod
+    def validate_bridges(bridges):
+        if (not isinstance(bridges, list) or not 1 <= len(bridges) <= 16
+            or any(not isinstance(bridge, str) or not BRIDGE.fullmatch(bridge) for bridge in bridges)):
+            raise Error("Выберите от 1 до 16 сегментов LAN")
+        return sorted(set(bridges))
+
     def normalize(self, fields):
-        required = {"mode", "bridge", "devices", "subnets"}
+        multiple = "bridges" in fields
+        required = {"mode", "bridges" if multiple else "bridge", "devices", "subnets"}
         if set(fields) - {"grants"} != required:
-            raise Error("Укажите режим, интерфейс LAN, устройства и подсети")
+            raise Error("Укажите режим, сегменты LAN, устройства и подсети")
         mode = fields["mode"]
         if mode not in ("off", "selected", "all"):
             raise Error("Неизвестный режим доступа")
         if mode == "off":
             return {"mode": "off", "bridge": "br0", "devices": [], "subnets": []}
-        bridge, devices, subnets = fields["bridge"], fields["devices"], fields["subnets"]
-        if not isinstance(bridge, str) or not re.fullmatch(r"br[0-9]{1,3}", bridge):
-            raise Error("Укажите LAN-интерфейс, например br0")
+        bridges = self.validate_bridges(self.bridges(fields))
+        devices, subnets = fields["devices"], fields["subnets"]
         if not isinstance(devices, list) or not isinstance(subnets, list):
             raise Error("Неверный список устройств или подсетей")
         if len(devices) > 16 or not 1 <= len(subnets) <= 64:
@@ -64,8 +76,9 @@ class LanAccess:
         if len({x.split()[0] for x in entries}) != len(entries):
             raise Error("Один IP-адрес должен соответствовать одному устройству")
         ordered_nets = sorted(nets)
-        config = {"mode": mode, "bridge": bridge, "devices": sorted(entries),
+        config = {"mode": mode, "devices": sorted(entries),
                   "subnets": [str(n) for n in ordered_nets]}
+        config.update({"bridges": bridges} if multiple else {"bridge": bridges[0]})
         if mode == "selected" and "grants" in fields:
             grants = fields["grants"]
             if not isinstance(grants, dict) or set(grants) != set(entries):
@@ -87,14 +100,17 @@ class LanAccess:
         return config.get("grants", dict.fromkeys(config["devices"], config["subnets"]))
 
     def neighbors(self, bridge):
-        if not re.fullmatch(r"br[0-9]{1,3}", bridge):
+        if not BRIDGE.fullmatch(bridge):
             raise Error("Укажите LAN-интерфейс, например br0")
         output = self.runner.run(["ip", "-4", "neigh", "show", "dev", bridge]).stdout
         pattern = r"^(\d+\.\d+\.\d+\.\d+)\s+lladdr\s+((?:[a-f0-9]{2}:){5}[a-f0-9]{2})"
         return dict(re.findall(pattern, output.lower(), re.M))
 
     def local_devices(self, bridge):
-        neighbors = self.neighbors(bridge)
+        return self.devices_on_bridges([bridge])
+
+    def devices_on_bridges(self, bridges):
+        bridges = self.validate_bridges(bridges)
         hotspot = self.runner.run(["ndmc", "-c", "show ip hotspot"], check=False).stdout
         names = {}
         for entry in re.split(r"(?m)^\s*host:\s*$", hotspot):
@@ -102,46 +118,85 @@ class LanAccess:
             name = re.search(r"(?m)^\s*name:[ \t]+([^\r\n]+)", entry)
             if mac and name:
                 names[mac[1].lower()] = name[1].strip()[:80]
-        return [{"ip": ip, "mac": mac, "name": names.get(mac, ip)}
-                for ip, mac in sorted(neighbors.items(), key=lambda row: ipaddress.IPv4Address(row[0]))][:128]
+        return [{"ip": ip, "mac": mac, "name": names.get(mac, ip), "bridge": bridge}
+                for bridge in bridges for ip, mac in sorted(self.neighbors(bridge).items(),
+                    key=lambda row: ipaddress.IPv4Address(row[0]))[:128]]
+
+    def addresses(self):
+        output = self.runner.run(["ip", "-4", "-o", "addr", "show"]).stdout
+        return [(parts[1], ipaddress.IPv4Interface(parts[3])) for parts in map(str.split, output.splitlines())
+                if len(parts) > 3 and parts[2] == "inet"]
+
+    def segments(self):
+        networks = {}
+        for device, address in self.addresses():
+            if BRIDGE.fullmatch(device):
+                networks.setdefault(device, set()).add(address.network)
+        info = self.runner.run(["ndmc", "-c", "show interface"], check=False).stdout
+        names = {}
+        for section in re.split(r'(?m)^Interface, name = ', info):
+            bridge = re.search(r"(?m)^\s*id:[ \t]+Bridge([0-9]{1,3})\s*$", section)
+            if bridge:
+                for field in ("description", "interface-name"):
+                    label = re.search(r"(?m)^\s*" + field + r":[ \t]+([^\r\n]+)", section)
+                    if label and label[1].strip():
+                        names["br" + bridge[1]] = label[1].strip()[:80]
+                        break
+        return [{"id": bridge, "name": names.get(bridge, bridge),
+                 "networks": [str(net) for net in sorted(networks[bridge])]} for bridge in sorted(networks)]
+
+    def device_bridge(self, config, device):
+        return config.get("device_bridges", {}).get(device) if "bridges" in config else config["bridge"]
 
     def verify_selection(self, config, snapshot):
         if snapshot["backend_state"] != "Running" or not snapshot["online"]:
             raise Error("Сначала подключите роутер к сети Tailscale")
         if snapshot["prefs"].get("ExitNodeID"):
             raise Error("Отключите внешний Exit Node перед настройкой доступа к подсетям")
-        addresses = self.runner.run(["ip", "-4", "-o", "addr", "show"]).stdout
-        pairs = [(line.split()[1], ipaddress.IPv4Interface(line.split()[3]))
-                 for line in addresses.splitlines() if len(line.split()) > 3 and line.split()[2] == "inet"]
+        pairs = self.addresses()
         local = {iface.network for _, iface in pairs}
         local.update(ipaddress.IPv4Network(n) for n in (snapshot["prefs"].get("AdvertiseRoutes") or [])
                      if ":" not in n and n != "0.0.0.0/0")
         for item in config["subnets"]:
             if any(ipaddress.IPv4Network(item).overlaps(network) for network in local):
                 raise Error("Подсеть пересекается с подключённой или объявленной сетью: " + item)
-        bridge = config["bridge"]
-        lan = [iface.network for dev, iface in pairs if dev == bridge]
-        if not lan:
-            raise Error("У выбранного интерфейса LAN отсутствует IPv4")
-        neighbors = self.neighbors(bridge)
+        bridges = self.bridges(config)
+        lan = {bridge: sorted({iface.network for dev, iface in pairs if dev == bridge}) for bridge in bridges}
+        for bridge, networks in lan.items():
+            if not networks:
+                raise Error("У сегмента " + bridge + " отсутствует IPv4")
+            if any(net.overlaps(other_net) for net in networks for other, other_nets in lan.items()
+                   if other != bridge for other_net in other_nets):
+                raise Error("IPv4-подсети выбранных сегментов пересекаются")
+        neighbors = {bridge: self.neighbors(bridge) for bridge in bridges} if config["devices"] else {}
         current = self.current()
-        saved = current["devices"] if current["bridge"] == bridge else []
+        device_bridges = {}
         for row in config["devices"]:
             addr, mac = row.split()
-            if not any(ipaddress.IPv4Address(addr) in network for network in lan):
+            bridge = next((bridge for bridge, networks in lan.items()
+                           if any(ipaddress.IPv4Address(addr) in network for network in networks)), None)
+            if bridge is None:
                 raise Error("Устройство находится за другим интерфейсом: " + addr)
-            observed = neighbors.get(addr)
-            if observed != mac and (observed or row not in saved):
+            observed = neighbors[bridge].get(addr)
+            saved = row in current["devices"] and bridge == self.device_bridge(current, row)
+            if observed != mac and (observed or not saved):
                 raise Error("Роутер пока не подтвердил пару IP и MAC для " + addr)
-        return {
+            device_bridges[row] = bridge
+        result = {
             "zero_tier_sources": sorted(str(iface.ip) for dev, iface in pairs
                                         if re.fullmatch(r"zt[a-zA-Z0-9]+", dev)),
-            "lan_sources": [str(network) for network in sorted(set(lan))],
         }
+        sources = {bridge: [str(net) for net in nets] for bridge, nets in lan.items()}
+        result.update({"lan_sources_by_bridge": sources, "device_bridges": device_bridges}
+                      if "bridges" in config else {"lan_sources": sources[bridges[0]]})
+        return result
 
     def plan(self, params, snapshot):
         config = self.normalize(params)
-        if config["mode"] == "selected" and "grants" not in config and "grants" in self.current():
+        current = self.current()
+        if config["mode"] != "off" and "bridges" in current and "bridges" not in config:
+            raise Error("Обновите страницу и проверьте выбранные сегменты", 409)
+        if config["mode"] == "selected" and "grants" not in config and "grants" in current:
             raise Error("Обновите страницу и проверьте индивидуальные разрешения", 409)
         if config["mode"] != "off":
             config.update(self.verify_selection(config, snapshot))
@@ -151,11 +206,12 @@ class LanAccess:
         if config["mode"] == "off":
             return set()
         if config["mode"] == "all":
-            pairs = [("all", net) for net in config["subnets"]]
+            pairs = [(bridge, "all", net) for bridge in self.bridges(config) for net in config["subnets"]]
         else:
-            pairs = [(row.split()[0], net) for row, nets in self.grants(config).items() for net in nets]
-        return {("from", source, "to", subnet, "iif", config["bridge"], "lookup", "52")
-                for source, subnet in pairs}
+            pairs = [(self.device_bridge(config, row), row.split()[0], net)
+                     for row, nets in self.grants(config).items() for net in nets]
+        return {("from", source, "to", subnet, "iif", bridge, "lookup", "52")
+                for bridge, source, subnet in pairs}
 
     def management_rules(self, config):
         return {("from", str(ipaddress.IPv4Address(addr)), "lookup", "main")
@@ -202,26 +258,35 @@ class LanAccess:
         return create + commands + self.chain_rules(table, config, chains)
 
     def chain_rules(self, table, config, chains):
-        bridge = config["bridge"]
+        bridges = self.bridges(config)
+        scoped = "bridges" in config
         chosen = [(row.split(), nets) for row, nets in self.grants(config).items()]
         if config["mode"] == "all":
-            sources = [(["-s", net], net, config["subnets"]) for net in config["lan_sources"]]
+            networks = config["lan_sources_by_bridge"] if scoped else {bridges[0]: config["lan_sources"]}
+            sources = [(bridge, ["-s", net], net, config["subnets"])
+                       for bridge, nets in networks.items() for net in nets]
         else:
-            sources = [(["-s", ip, "-m", "mac", "--mac-source", mac], ip, nets) for (ip, mac), nets in chosen]
+            sources = [(self.device_bridge(config, ip + " " + mac), ["-s", ip, "-m", "mac", "--mac-source", mac], ip, nets)
+                       for (ip, mac), nets in chosen]
         head = chains[0]
         if table == "nat":
             return [" ".join([f"-A {head} -o {self.tun}", "-s", ip,
                               "-d", net, "-j MASQUERADE"])
-                    for _, ip, nets in sources for net in nets]
+                    for _, _, ip, nets in sources for net in nets]
         guard = chains[1]
-        rules = [f"-A {head} -i {bridge} -d {net} -j {guard}" for net in config["subnets"]]
+        rules = [f"-A {head} -i {bridge} -d {net} -j {guard}" for bridge in bridges for net in config["subnets"]]
         if table == "filter":
-            rules += [f"-A {head} -i {self.tun} -o {bridge} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"]
+            if scoped:
+                # RouteAll installs Tailscale routes globally. Gate other LAN bridges at forwarding.
+                rules += [f"-A {head} -i br+ -o {self.tun} -d {net} -j DROP" for net in config["subnets"]]
+            rules += [f"-A {head} -i {self.tun} -o {bridge} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+                      for bridge in bridges]
         allow = ["-o", self.tun] if table == "filter" else []
-        for match, _, nets in sources:
+        for bridge, match, _, nets in sources:
+            ingress = ["-i", bridge] if scoped else []
             # The parent chain already checks the catalog. Use one rule for a full grant.
             limits = [[]] if set(nets) == set(config["subnets"]) else [["-d", net] for net in nets]
-            rules += [" ".join([f"-A {guard}", *match, *limit, *allow, "-j ACCEPT"]) for limit in limits]
+            rules += [" ".join([f"-A {guard}", *ingress, *match, *limit, *allow, "-j ACCEPT"]) for limit in limits]
         return rules + [f"-A {guard} -j DROP"]
 
     def payload(self, config, previous):

@@ -217,19 +217,24 @@ class Service:
             existing = self.lan_access.current()
             wanted = self.lan_access.plan(params, s)
             lan_revision = existing
-            modes = {"off": "Выключено", "selected": "По устройствам", "all": "Весь сегмент"}
+            modes = {"off": "Выключено", "selected": "По устройствам", "all": "Все устройства выбранных сегментов"}
             changes = [
                 {"name": "Доступ из LAN", "before": modes[existing["mode"]], "after": modes[wanted["mode"]]},
-                {"name": "Сегмент LAN", "before": existing["bridge"], "after": wanted["bridge"]},
+                {"name": "Сегменты LAN",
+                 "before": self.lan_access.bridges(existing) if existing["mode"] != "off" else [],
+                 "after": self.lan_access.bridges(wanted) if wanted["mode"] != "off" else []},
                 {"name": "Подсети", "before": existing["subnets"], "after": wanted["subnets"]},
             ]
+            if "bridges" in wanted and "bridges" not in existing:
+                changes.append({"name": "Через Tailscale из остальных сегментов",
+                                "before": "По системным правилам", "after": "Закрыто к указанным подсетям"})
             previous_grants = self.lan_access.grants(existing)
             grants = self.lan_access.grants(wanted)
             changes.extend({"name": device, "before": previous_grants.get(device, []),
                             "after": grants.get(device, [])}
                            for device in sorted(previous_grants.keys() | grants.keys()))
             changes = [change for change in changes if change["before"] != change["after"]]
-            message = "При индивидуальном доступе каждое устройство получает только отмеченные для него подсети."
+            message = "Проверьте выбранные сегменты и разрешённые подсети."
         elif action == "settings":
             if self.lan_access.current()["mode"] != "off" and (
                 params.get("accept_routes") is False or params.get("exit_node")

@@ -79,14 +79,16 @@ function systemView(){
 }
 function lanAccessView(){
  const c=data.lan_access||{mode:'off',bridge:'br0',subnets:[]};
- const modes={off:'Выключено',selected:'По устройствам',all:'Весь сегмент'};
- return intro('Доступ устройств','Выберите устройство, отметьте нужные ему подсети и сохраните правила.')+
+ const modes={off:'Выключено',selected:'По устройствам',all:'Все устройства выбранных сегментов'};
+ return intro('Доступ устройств','Выберите локальные сегменты и настройте доступ к удалённым подсетям.')+
   '<section class="surface lan-access"><form id="lan-access-form">'+
+  '<fieldset class="lan-segments" data-lan-scope><legend>Сегменты Keenetic</legend>'+
+  '<div class="lan-segment-grid" data-lan-segments></div><p class="muted small" data-lan-segment-status role="status"></p></fieldset>'+
   '<div class="lan-device-area" data-lan-selected><div class="lan-device-list">'+
   '<h2>Кому дать доступ?</h2><div data-lan-devices></div>'+
   '<button type="button" class="lan-add-button" data-lan-open>+ Добавить из Keenetic</button></div>'+
   '<div class="lan-device-editor" data-lan-editor></div></div>'+
-  '<div class="note lan-state" data-lan-all><strong>Доступ открыт всему сегменту</strong>'+
+  '<div class="note lan-state" data-lan-all><strong>Доступ для всех устройств выбранных сегментов</strong>'+
   '<p>Чтобы выбирать сети отдельно для каждого устройства, переключите режим.</p>'+
   '<button type="button" data-lan-enable>Выбрать устройства</button></div>'+
   '<div class="note lan-state" data-lan-off><strong>Правила доступа выключены</strong>'+
@@ -94,7 +96,7 @@ function lanAccessView(){
   '<details class="lan-advanced"><summary>Дополнительные настройки</summary>'+
   '<div class="lan-advanced-grid"><label class="lan-mode">Режим доступа<select name="mode">'+
   Object.entries(modes).map(([value,label])=>'<option value="'+value+'" '+(c.mode===value?'selected':'')+'>'+label+'</option>').join('')+
-  '</select></label><label>Интерфейс LAN<input name="bridge" value="'+E(c.bridge)+'" placeholder="br0" autocomplete="off"></label></div>'+
+  '</select></label></div>'+
   '<label>Список удалённых подсетей <span data-lan-count></span><textarea name="subnets" spellcheck="false" placeholder="192.168.10.0/24">'+
   E(c.subnets.join('\n'))+'</textarea></label>'+
   '<div class="lan-inline"><p class="muted small">Одна IPv4-подсеть на строку. Удаление из списка снимает ограничение для этой подсети.</p>'+
@@ -114,11 +116,16 @@ function bindLanAccess(){
  const form=$('#lan-access-form');
  if(!form)return;
  const state=data.lan_access||{mode:'off',bridge:'br0',devices:[],subnets:[]};
- const {mode,bridge,subnets,manual_ip:manualIp,manual_mac:manualMac,device_search:search}=form.elements;
+ const {mode,subnets,manual_ip:manualIp,manual_mac:manualMac,device_search:search}=form.elements;
  const devices=$('[data-lan-devices]',form), editor=$('[data-lan-editor]',form);
  const picker=$('.lan-picker',form), pickerList=$('[data-lan-picker-list]',picker), pickerStatus=$('[data-lan-picker-status]',picker);
  const openPicker=$('[data-lan-open]',form);
  const grants=new Map((state.devices||[]).map(device=>[device,new Set(state.grants?.[device]??state.subnets)]));
+ const bridges=new Set(state.bridges||[state.bridge]);
+ const deviceBridges=new Map((state.devices||[]).map(device=>[device,state.device_bridges?.[device]||state.bridge]));
+ const segmentList=$('[data-lan-segments]',form), segmentStatus=$('[data-lan-segment-status]',form);
+ const segments=new Map();
+ let segmentLoadFailed=false;
  const nearby=new Map();
  const sources=new Map();
  for(const peer of data.tailscale.peers){
@@ -128,6 +135,30 @@ function bindLanAccess(){
  let active=grants.keys().next().value;
  const routes=()=>[...new Set(subnets.value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean))];
  const name=device=>nearby.get(device)?.name||device.split(' ')[0];
+ const segmentName=id=>segments.get(id)?.name||id;
+ const visibleDevices=()=>[...grants.keys()].filter(device=>bridges.has(deviceBridges.get(device)));
+
+ function renderSegments(){
+  const ids=[...new Set([...segments.keys(),...bridges])].sort();
+  segmentList.innerHTML=ids.map(id=>'<label class="lan-route-option"><input type="checkbox" value="'+E(id)+'" '+
+   (bridges.has(id)?'checked':'')+'><span class="lan-route-name"><strong>'+E(segmentName(id))+'</strong><small>'+
+   E([id,...(segments.get(id)?.networks||[])].join(' · '))+'</small></span></label>').join('');
+  $$('input',segmentList).forEach(box=>box.onchange=()=>{
+   if(box.checked)bridges.add(box.value);else bridges.delete(box.value);
+   if(!visibleDevices().includes(active))active=visibleDevices()[0];
+   render();
+   loadDevices();
+  });
+ }
+
+ async function loadSegments(){
+  try{
+   const found=await api('/api/lan-segments');
+   if(!form.isConnected)return;
+   for(const segment of found)segments.set(segment.id,segment);
+  }catch(e){segmentLoadFailed=true;}
+  if(form.isConnected){renderSegments();render();}
+ }
 
  function renderEditor(){
   if(!active){
@@ -150,7 +181,8 @@ function bindLanAccess(){
   updateCount();
   $('[data-lan-remove]',editor).onclick=()=>{
    grants.delete(active);
-   active=grants.keys().next().value;
+   deviceBridges.delete(active);
+   active=visibleDevices()[0];
    render();
    ($('[aria-pressed="true"]',devices)||$('[data-lan-open]',form)).focus();
   };
@@ -165,12 +197,13 @@ function bindLanAccess(){
 
  function renderDevices(){
   const available=routes();
-  devices.innerHTML=[...grants].map(([device,list],index)=>
+  const visible=visibleDevices();
+  devices.innerHTML=visible.map((device,index)=>
    '<button type="button" class="lan-device" aria-pressed="'+(device===active)+'" data-lan-index="'+index+'">'+
-   '<span><strong>'+E(name(device))+'</strong><small>'+E(device.split(' ')[0])+'</small></span>'+
-   '<span class="lan-device-count">'+available.filter(route=>list.has(route)).length+' из '+available.length+'</span></button>').join('');
+   '<span><strong>'+E(name(device))+'</strong><small>'+E(device.split(' ')[0]+' · '+segmentName(deviceBridges.get(device)))+'</small></span>'+
+   '<span class="lan-device-count">'+available.filter(route=>grants.get(device).has(route)).length+' из '+available.length+'</span></button>').join('');
   $$('[data-lan-index]',devices).forEach(button=>button.onclick=()=>{
-   active=[...grants.keys()][Number(button.dataset.lanIndex)];
+   active=visible[Number(button.dataset.lanIndex)];
    render();
    $('[aria-pressed="true"]',devices)?.focus();
   });
@@ -179,7 +212,8 @@ function bindLanAccess(){
  function renderPicker(){
   if(!picker.open)return;
   const query=search.value.trim().toLowerCase();
-  const choices=[...nearby].filter(([,entry])=>[entry.name,entry.ip,entry.mac].some(value=>value.toLowerCase().includes(query)));
+  const choices=[...nearby].filter(([,entry])=>bridges.has(entry.bridge)&&
+   [entry.name,entry.ip,entry.mac,segmentName(entry.bridge)].some(value=>value.toLowerCase().includes(query)));
   if(!choices.length){
    const message=loading?'Загружаем устройства…':loadFailed?'Не удалось загрузить. Закройте окно и откройте его снова.':
     query?'Совпадений нет. Попробуйте другое имя или адрес.':'Подключите устройство к Keenetic или введите его IP и MAC вручную.';
@@ -190,32 +224,43 @@ function bindLanAccess(){
   pickerStatus.textContent='Найдено устройств: '+choices.length;
   pickerList.innerHTML=choices.map(([device,entry],index)=>
    '<button type="button" class="lan-picker-device" data-lan-choice="'+index+'"><span><strong>'+E(entry.name)+'</strong>'+
-   '<small>'+E(entry.ip)+' · '+E(entry.mac)+'</small></span><span class="lan-picker-action">'+
+   '<small>'+E(entry.ip+' · '+entry.mac)+'</small><small>'+E(segmentName(entry.bridge))+'</small></span><span class="lan-picker-action">'+
    (grants.has(device)?'Открыть':'Выбрать')+'</span></button>').join('');
   $$('[data-lan-choice]',pickerList).forEach(button=>button.onclick=()=>{
    picker.close('selected');
-   add(choices[Number(button.dataset.lanChoice)][0]);
+   const [device,entry]=choices[Number(button.dataset.lanChoice)];
+   add(device,entry.bridge);
   });
  }
 
  function render(){
   const enabled=mode.value!=='off', selected=mode.value==='selected';
+  $('[data-lan-scope]',form).hidden=!enabled;
   $('[data-lan-off]',form).hidden=enabled;
   $('[data-lan-selected]',form).hidden=!selected;
   $('[data-lan-all]',form).hidden=mode.value!=='all';
   $('[data-lan-count]',form).textContent=String(routes().length);
   $('.lan-footer',form).hidden=!enabled&&state.mode==='off';
+  const excluded=grants.size-visibleDevices().length;
+  segmentStatus.textContent=segmentLoadFailed?'Не удалось загрузить список сегментов. Обновите страницу.':
+   !bridges.size?'Выберите хотя бы один сегмент.':
+   selected&&excluded?'Правила для устройств снятых сегментов будут удалены при сохранении.':'';
+  openPicker.disabled=!bridges.size;
+  $('[type="submit"]',form).disabled=enabled&&!bridges.size;
   if(selected){renderDevices();renderEditor();}
   renderPicker();
  }
 
  async function loadDevices(){
-  const request=++requests, requested=bridge.value.trim();
+  const request=++requests;
+  if(!bridges.size){nearby.clear();loading=false;render();return;}
+  const params=new URLSearchParams();
+  for(const bridge of bridges)params.append('bridge',bridge);
   loading=true;
   loadFailed=false;
   renderPicker();
   try{
-   const found=await api('/api/lan-devices?bridge='+encodeURIComponent(requested));
+   const found=await api('/api/lan-devices?'+params);
    if(request!==requests||!form.isConnected)return;
    nearby.clear();
    for(const entry of found)nearby.set(entry.ip+' '+entry.mac,entry);
@@ -225,10 +270,11 @@ function bindLanAccess(){
   }
  }
 
- function add(device){
+ function add(device,bridge){
   if(!device)return;
   if(grants.size>=16&&!grants.has(device)){toast('Можно добавить до 16 устройств.',true);return;}
   if(!grants.has(device))grants.set(device,new Set());
+  deviceBridges.set(device,bridge);
   active=device;
   render();
   $('[aria-pressed="true"]',devices)?.focus();
@@ -256,12 +302,19 @@ function bindLanAccess(){
  });
  $('[data-lan-manual]',form).onclick=()=>{
   const ip=manualIp.value.trim(), mac=manualMac.value.trim().toLowerCase().replace(/-/g,':');
-  if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)||!/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(mac)){
+  if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)||ip.split('.').some(part=>Number(part)>255)||
+     !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(mac)){
    toast('Введите IPv4 и MAC устройства.',true);
    return;
   }
+  const ipNumber=address=>address.split('.').reduce((number,part)=>(number*256)+Number(part),0);
+  const bridge=[...bridges].find(id=>segments.get(id)?.networks.some(cidr=>{
+   const [network,prefix]=cidr.split('/'), size=2**(32-Number(prefix));
+   return Math.floor(ipNumber(ip)/size)===Math.floor(ipNumber(network)/size);
+  }))||(bridges.size===1?bridges.values().next().value:null);
+  if(!bridge){toast('IP устройства должен относиться к одному из выбранных сегментов.',true);return;}
   picker.close('selected');
-  add(ip+' '+mac);
+  add(ip+' '+mac,bridge);
   manualIp.value=manualMac.value='';
  };
  const advertised=[...sources.keys()].filter(route=>/^(?:\d{1,3}\.){3}\d{1,3}\/(?:[1-9]|[12]\d|3[0-2])$/.test(route));
@@ -269,20 +322,21 @@ function bindLanAccess(){
  importButton.hidden=!advertised.length;
  importButton.onclick=()=>{subnets.value=[...new Set([...routes(),...advertised])].join('\n');render();};
  mode.onchange=()=>{render();if(mode.value==='selected')loadDevices();};
- bridge.onchange=()=>{nearby.clear();render();if(mode.value==='selected')loadDevices();};
  subnets.onchange=render;
  form.onsubmit=e=>{
   e.preventDefault();
   if(picker.open)return;
   const available=routes();
-  const params={mode:mode.value,bridge:bridge.value.trim(),subnets:available,devices:[]};
+  const params={mode:mode.value,bridges:[...bridges],subnets:available,devices:[]};
   if(mode.value==='selected'){
-   params.devices=[...grants.keys()];
-   params.grants=Object.fromEntries([...grants].map(([device,list])=>[device,available.filter(route=>list.has(route))]));
+   params.devices=visibleDevices();
+   params.grants=Object.fromEntries(params.devices.map(device=>[device,available.filter(route=>grants.get(device).has(route))]));
   }
   plan('lan_access',params);
  };
+ renderSegments();
  render();
+ loadSegments();
  if(mode.value==='selected')loadDevices();
 }
 

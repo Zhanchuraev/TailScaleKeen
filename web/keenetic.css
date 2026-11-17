@@ -89,6 +89,12 @@ button.copy-address:hover{background:color-mix(in srgb,var(--blue) 9%,var(--bg))
 .address-line.secondary button.copy-address .icon{width:12px;height:14px}
 
 .lan-access [hidden] { display: none !important; }
+.lan-segments { margin: 0 0 16px; padding: 0; min-width: 0; border: 0; }
+.lan-segments legend { margin-bottom: 8px; padding: 0; font-size: 18px; font-weight: 650; }
+.lan-segment-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 8px; }
+.lan-segment-grid .lan-route-option { max-width: none; }
+.lan-segment-grid small { color: var(--muted); overflow-wrap: anywhere; }
+[data-lan-segment-status]:empty { display: none; }
 .page-routes .button-link {
   display: inline-flex;
   align-items: center;
@@ -185,7 +191,6 @@ button.copy-address:hover{background:color-mix(in srgb,var(--blue) 9%,var(--bg))
 .lan-advanced { margin: 0; padding: 10px 0; border-top: 1px solid var(--line); }
 .lan-advanced summary { color: var(--text); font-weight: 600; }
 .lan-advanced-grid { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; }
-.lan-advanced-grid input, .lan-advanced-grid select { max-width: 210px; }
 .lan-advanced textarea { min-height: 86px; max-height: 190px; }
 .lan-footer { margin-top: 10px; }
 .lan-picker { max-width: 540px; max-height: 88vh; overflow-y: auto; }
