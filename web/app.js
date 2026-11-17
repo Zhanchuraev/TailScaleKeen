@@ -2,7 +2,7 @@
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const E=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let session={}, data=null, page='overview', nativeData=null, query='', activeJob=null, pendingPlan=null, refreshBusy=false, credentialsBusy=false, activeDevice=null;
-const pages={overview:'Системный монитор',exit:'Выход в интернет',peers:'Клиенты',routes:'Подсети и DNS',native:'Подключение Keenetic',diagnostics:'Диагностика',logs:'Журналы',backups:'Резервные копии',system:'Клиент и панель'};
+const pages={overview:'Системный монитор',exit:'Выход в интернет',peers:'Клиенты',routes:'Подсети и DNS','lan-access':'Доступ устройств',native:'Подключение Keenetic',diagnostics:'Диагностика',logs:'Журналы',backups:'Резервные копии',system:'Клиент и панель'};
 const labels={accept_dns:'Принимать DNS с сервера',accept_routes:'Принимать маршруты подсетей',allow_lan:'Доступ к своей LAN при использовании внешнего Exit node',shields_up:'Блокировать входящие подключения',ssh:'Tailscale SSH',webclient:'Встроенный веб-клиент',snat:'SNAT подсетей',stateful:'Фильтрация соединений'};
 async function api(url,body){
  const opt={headers:{},credentials:'same-origin',signal:AbortSignal.timeout(45000)};
@@ -53,7 +53,7 @@ function authLink(){const url=data.tailscale.auth_url;if(!url||!/^https:\/\//.te
 function overview(){const s=data.tailscale,p=s.prefs,exit=selectedExit(),own=s.self;return intro('Системный монитор','Tailscale на роутере: устройства, защищённые маршруты и выход в интернет.',`<button data-action="${s.backend_state==='Running'?'disconnect':'resume'}">${s.backend_state==='Running'?'Отключить':'Подключить'}</button><button data-action="restart" class="quiet">Перезапустить</button>`)+health()+authLink()+`<div class="split"><section class="surface"><div class="network-head"><div class="identity">${E(own.HostName||p.Hostname||'Роутер')}<small>${E(own.DNSName||'Узел Keenetic / Netcraze')}</small></div><span class="status-badge ${s.online?'good':'warn'}">${stateLabel(s.backend_state)}</span></div><div class="network-path"><div class="path-node"><strong>Ваш роутер</strong><small>${E(address(own))}</small></div><span class="path-connector">⟷</span><div class="path-node"><strong>${exit?E(exit.HostName):'Сеть Tailscale'}</strong><small>${exit?'Выход через Exit node':(s.peers.filter(n=>n.Online).length+' устройств в сети')}</small></div><span class="path-connector">⟷</span><div class="path-node"><strong>${exit?'Интернет':'Другие устройства'}</strong><small>${exit?'Защищённый выход':'Прямые связи / DERP'}</small></div></div>${pairs([['Сервер управления',E(p.ControlURL||'—')],['Выходной узел',exit?`<a href="#exit">${E(exit.HostName)}</a>`:'<a href="#exit">Не используется</a>'],['Адрес IPv6',E((own.TailscaleIPs||[]).find(x=>x.includes(':'))||'—')],['Версия клиента',E(s.version.split('-')[0]||'Не установлен')]])}<div class="stat-row"><div><strong>${s.peers.filter(n=>n.Online).length}<span> / ${s.peers.length}</span></strong><span>Устройств в сети</span></div><div><strong>${bytes(data.metrics?.rx_bytes)}</strong><span>Получено</span></div><div><strong>${bytes(data.metrics?.tx_bytes)}</strong><span>Отправлено</span></div></div></section><div class="stack"><section class="surface"><h2>Состояние роутера</h2>${pairs([['Работает',E(duration(data.system.uptime))],['Интерфейс',E(data.config.tun)],['Архитектура',E(data.system.architecture)],['Подсети',E((p.AdvertiseRoutes||[]).filter(x=>!x.endsWith('/0')).length)],['Выход через роутер',s.exit_advertised?'Объявлен в сети':'Выключен']])}<p class="muted small">Одобрение маршрутов и Exit node задаётся на сервере вашей сети.</p><a href="#native">Подключение в Keenetic</a></section><section class="surface"><h2>Последние операции</h2><ul class="job-list">${jobRows()}</ul></section></div></div><section class="surface"><div class="section-heading"><h2>Клиенты в сети</h2><a href="#peers">Все клиенты</a></div>${peerTable(s.peers.filter(n=>n.Online).slice(0,5),true)}</section>`}
 function exitView(){const s=data.tailscale,p=s.prefs,selected=selectedExit(),nodes=s.peers.filter(n=>n.ExitNodeOption);return intro('Выход в интернет','Настройка внешнего Exit node и раздачи интернета через этот роутер.')+`<div class="split"><section class="surface"><div class="section-heading"><h2>Выход через другое устройство</h2><span class="pill">${nodes.length} доступно</span></div><div class="node-choice ${!selected?'selected':''}"><div><h3>Прямое подключение</h3><p>Не использовать другой Exit node</p></div><button data-exit="" ${!selected?'disabled':''}>${!selected?'Выбрано':'Выбрать'}</button></div>${nodes.map(n=>`<div class="node-choice ${n.ID===p.ExitNodeID?'selected':''}"><div><h3>${E(n.HostName)} ${n.ID===p.ExitNodeID?'<span class="pill">Текущий</span>':''}</h3><p>${goodBadge(n.Online)} · ${E(address(n))} · ${E(n.OS||'Устройство')}</p></div><button data-exit="${E(n.ID)}" ${!n.Online||n.ID===p.ExitNodeID?'disabled':''}>${n.ID===p.ExitNodeID?'Выбран':'Выбрать'}</button></div>`).join('')}${nodes.length?'':'<p class="empty">В сети пока нет одобренных Exit nodes. Сначала включите эту роль на одном из устройств и разрешите её в консоли сервера.</p>'}<form id="exit-options">${check('allow_lan','Доступ к своей LAN','Исключение для локальной сети при использовании внешнего Exit node. Не управляет объявлением подсетей.',p.ExitNodeAllowLANAccess)}<div class="form-actions"><button type="submit" ${!selected?'disabled':''}>Сохранить доступ к LAN</button></div></form></section><section class="surface"><h2>Этот роутер — Exit node</h2><p class="muted">Другие устройства смогут использовать интернет-подключение вашего роутера.</p><form id="advertise-form">${check('advertise_exit','Раздавать интернет в Tailscale','Объявить этот роутер как выходной узел.',s.exit_advertised)}<div class="note">После включения разрешите маршруты <code>0.0.0.0/0</code> и <code>::/0</code> в консоли Tailscale / Headscale.</div><div class="form-actions"><button type="submit" class="primary">Проверить и применить</button></div></form><div id="egress-section" class="egress-control"><h3>Через что раздавать интернет</h3><p class="muted">Получение политик подключений…</p></div><div class="keyline"></div><h3>Проверка выхода</h3><p class="muted small">HTTPS-запрос через интерфейс Tailscale без изменения настроек.</p><button data-diag="exit">Проверить выход</button></section></div>`}
 function peersView(){const all=[{...data.tailscale.self,Online:data.tailscale.online,is_self:true},...data.tailscale.peers];const peers=all.filter(n=>[n.HostName,n.DNSName,...(n.TailscaleIPs||[]),data.devices?.[n.ID]?.notes].join(' ').toLowerCase().includes(query.toLowerCase()));return intro('Клиенты','Клиенты сети Tailscale, их веб-интерфейсы и ваши личные заметки.')+`<section class="surface"><div class="section-heading"><h2>Узлы сети <span class="pill">${all.length}</span></h2><input id="peer-search" class="search" type="search" aria-label="Найти клиента" placeholder="Имя, IP или заметка" value="${E(query)}"></div>${peerTable(peers)}<p class="device-help">«Панель» открывает управление этим роутером. «Веб» — адрес другого узла, обычно Tailscale :5252. Это ссылка, а не подтверждение доступности: нужен включённый веб-клиент и доступ через Tailscale. На Headscale 0.29.7 встроенный веб-клиент работает для просмотра сведений. Другой адрес и заметку можно задать в карточке.</p></section>`}
-function routesView(){const p=data.tailscale.prefs;return intro('Подсети и DNS','Управление маршрутами клиента без перезаписи остальных параметров.')+lanAccessView()+`<div class="split"><section class="surface"><h2>Маршруты подсетей</h2><form id="routes-form"><label>Подсети за этим роутером<textarea name="routes" spellcheck="false" placeholder="192.168.10.0/24">${E((p.AdvertiseRoutes||[]).filter(x=>!x.endsWith('/0')).join('\n'))}</textarea></label><p class="muted small">По одной сети в строке. После объявления разрешите маршруты в консоли сервера.</p><button type="submit" class="primary">Проверить маршруты</button></form><div class="keyline"></div><form id="route-options">${check('accept_routes','Принимать маршруты других устройств','Использовать доступные подсети вашей сети Tailscale.',p.RouteAll)}${check('snat','SNAT для маршрутов подсетей','Подменять адрес источника при доступе из Tailscale в локальные сети.',!p.NoSNAT)}${check('stateful','Фильтрация перенаправленных соединений','Отслеживать состояния соединений между интерфейсами.',!p.NoStatefulFiltering)}<div class="form-actions"><button type="submit">Сохранить параметры</button></div></form></section><section class="surface"><h2>DNS и доступ</h2><form id="dns-form">${check('accept_dns','Принимать DNS с сервера','На Keenetic обычно выключено, чтобы сохранить штатный DNS роутера.',p.CorpDNS)}${check('shields_up','Блокировать входящие подключения','Узел останется в сети, но перестанет принимать входящие подключения от пиров.',p.ShieldsUp)}<div class="form-actions"><button type="submit">Сохранить DNS и доступ</button></div></form><div class="note">Настройки DHCP и DNS в самой KeeneticOS эта панель не заменяет.</div><div class="keyline"></div><h3>Объявленные другими узлами сети</h3>${pairs(data.tailscale.peers.filter(n=>n.PrimaryRoutes?.length).map(n=>[n.HostName,E(n.PrimaryRoutes.join(', '))]))}</section></div>`}
+function routesView(){const p=data.tailscale.prefs;return intro('Подсети и DNS','Управление маршрутами клиента без перезаписи остальных параметров.', '<a class="button-link" href="#lan-access">Настроить доступ устройств</a>')+`<div class="split"><section class="surface"><h2>Маршруты подсетей</h2><form id="routes-form"><label>Подсети за этим роутером<textarea name="routes" spellcheck="false" placeholder="192.168.10.0/24">${E((p.AdvertiseRoutes||[]).filter(x=>!x.endsWith('/0')).join('\n'))}</textarea></label><p class="muted small">По одной сети в строке. После объявления разрешите маршруты в консоли сервера.</p><button type="submit" class="primary">Проверить маршруты</button></form><div class="keyline"></div><form id="route-options">${check('accept_routes','Принимать маршруты других устройств','Использовать доступные подсети вашей сети Tailscale.',p.RouteAll)}${check('snat','SNAT для маршрутов подсетей','Подменять адрес источника при доступе из Tailscale в локальные сети.',!p.NoSNAT)}${check('stateful','Фильтрация перенаправленных соединений','Отслеживать состояния соединений между интерфейсами.',!p.NoStatefulFiltering)}<div class="form-actions"><button type="submit">Сохранить параметры</button></div></form></section><section class="surface"><h2>DNS и доступ</h2><form id="dns-form">${check('accept_dns','Принимать DNS с сервера','На Keenetic обычно выключено, чтобы сохранить штатный DNS роутера.',p.CorpDNS)}${check('shields_up','Блокировать входящие подключения','Узел останется в сети, но перестанет принимать входящие подключения от пиров.',p.ShieldsUp)}<div class="form-actions"><button type="submit">Сохранить DNS и доступ</button></div></form><div class="note">Настройки DHCP и DNS в самой KeeneticOS эта панель не заменяет.</div><div class="keyline"></div><h3>Объявленные другими узлами сети</h3>${pairs(data.tailscale.peers.filter(n=>n.PrimaryRoutes?.length).map(n=>[n.HostName,E(n.PrimaryRoutes.join(', '))]))}</section></div>`}
 function nativeView(){const n=nativeData;if(!n)return intro('Подключение Keenetic','Подключение OpkgTun в штатном списке соединений роутера.')+'<section class="surface muted">Читаю настройки подключения…</section>';return intro('Подключение Keenetic','Создайте подключение Tailscale в интерфейсе Keenetic / Netcraze, как обычное интернет-соединение.')+`<div class="split"><section class="surface"><div class="section-heading"><h2>${E(n.name)}</h2><span class="status-badge ${n.exists?'good':'warn'}">${n.exists?'Подключение существует':'Не создано'}</span></div>${!n.available?`<div class="alert">${E(n.error)}</div>`:''}<form id="native-form"><label>Название подключения<input name="description" value="${E(n.description||'Tailscale')}" maxlength="50" ${n.exists?'disabled':''}></label><div class="form-grid"><label>Интерфейс<input value="${E(n.name)}" disabled></label><label>MTU<select name="mtu" ${n.exists?'disabled':''}>${[1280,1360,1420,1500].map(m=>`<option value="${m}" ${m==n.mtu?'selected':''}>${m}</option>`).join('')}</select></label></div>${check('global','Показывать как интернет-подключение','Позволяет выбрать соединение в политиках подключений роутера.',n.exists?n.global:true)}${check('save','Сохранить в конфигурацию роутера','Созданное подключение сохранится после перезагрузки.',true)}<div class="form-actions"><button class="primary" type="submit" ${!n.available?'disabled':''}>${n.exists?'Проверить существующее':'Создать подключение'}</button></div></form><div class="note">${n.exists?'Существующие параметры OpkgTun сохраняются. Повторная проверка не создаёт дубликат.':'Tailscale управляет адресами туннеля сам. Вручную задавать ему IP-адрес не нужно.'}</div></section><section class="surface"><h2>Связь с политиками</h2>${pairs([['Интерфейс Linux',E(n.tun||data.config.tun)],['Состояние',n.connected?'Подключён':'Не подключён'],['Создан панелью',n.managed?'Да':'Существующее подключение']])}<h3>Обнаруженные политики</h3>${(n.policies||[]).length?pairs(n.policies.map(p=>[p.name,'Таблица '+E(p.table)])):'<p class="muted small">Политик с этим подключением пока не обнаружено.</p>'}<div class="note">Назначение устройств и приоритеты соединений остаются в штатном веб-конфигураторе Keenetic. Панель сохраняет существующие политики.</div><a href="/" id="router-link" target="_blank" rel="noopener">Открыть панель роутера</a></section></div>`}
 function diagnosticsView(){return intro('Диагностика','Проверки выполняются на роутере и не меняют его сетевые настройки.')+`
  <section class="surface"><div class="section-heading"><h2>Состояние панели и клиента</h2><div class="actions"><button id="check-health" class="primary">Проверить состояние</button><a href="/api/support-report" download>Скачать отчёт</a></div></div><p class="muted small">Версии компонентов, интерфейс, права доступа и место для обновлений. Отчёт не включает адреса, имена устройств, сервер управления, заметки, журналы и ключи.</p><div id="health-result" aria-live="polite"></div></section>
@@ -80,65 +80,85 @@ function systemView(){
 function lanAccessView(){
  const c=data.lan_access||{mode:'off',bridge:'br0',subnets:[]};
  const modes={off:'Выключено',selected:'По устройствам',all:'Весь сегмент'};
- return '<section class="surface lan-access"><header class="lan-heading"><div>'+
-  '<h2>Доступ к удалённым подсетям</h2><p class="muted">Укажите, какие сети открывать устройствам за роутером.</p></div>'+
-  '<label class="lan-mode">Режим доступа<select name="mode" form="lan-access-form">'+
-  Object.entries(modes).map(([value,label])=>'<option value="'+value+'" '+(c.mode===value?'selected':'')+'>'+label+'</option>').join('')+
-  '</select></label></header><form id="lan-access-form">'+
-  '<div data-lan-options><details class="lan-catalog"><summary>Удалённые подсети <span data-lan-count></span></summary>'+
-  '<label>Подсети IPv4<textarea name="subnets" spellcheck="false" placeholder="192.168.10.0/24">'+E(c.subnets.join('\n'))+'</textarea></label>'+
-  '<div class="lan-inline"><p class="muted small">Одна подсеть на строку. Чтобы отозвать доступ у ПК, снимите отметку у самого ПК.</p>'+
-  '<button type="button" class="quiet" data-lan-import>Добавить из Tailscale</button></div></details>'+
+ return intro('Доступ устройств','Выберите устройство, отметьте нужные ему подсети и сохраните правила.')+
+  '<section class="surface lan-access"><form id="lan-access-form">'+
   '<div class="lan-device-area" data-lan-selected><div class="lan-device-list">'+
-  '<h3>Устройства</h3><div data-lan-devices></div><div class="lan-add">'+
-  '<label for="lan-neighbor">Добавить устройство</label><select id="lan-neighbor"></select>'+
-  '<button type="button" data-lan-add>Добавить</button>'+
+  '<h2>Кому дать доступ?</h2><div data-lan-devices></div>'+
+  '<button type="button" class="lan-add-button" data-lan-open>+ Добавить из Keenetic</button></div>'+
+  '<div class="lan-device-editor" data-lan-editor></div></div>'+
+  '<div class="note lan-state" data-lan-all><strong>Доступ открыт всему сегменту</strong>'+
+  '<p>Чтобы выбирать сети отдельно для каждого устройства, переключите режим.</p>'+
+  '<button type="button" data-lan-enable>Выбрать устройства</button></div>'+
+  '<div class="note lan-state" data-lan-off><strong>Правила доступа выключены</strong>'+
+  '<button type="button" data-lan-enable>Настроить доступ</button></div>'+
+  '<details class="lan-advanced"><summary>Дополнительные настройки</summary>'+
+  '<div class="lan-advanced-grid"><label class="lan-mode">Режим доступа<select name="mode">'+
+  Object.entries(modes).map(([value,label])=>'<option value="'+value+'" '+(c.mode===value?'selected':'')+'>'+label+'</option>').join('')+
+  '</select></label><label>Интерфейс LAN<input name="bridge" value="'+E(c.bridge)+'" placeholder="br0" autocomplete="off"></label></div>'+
+  '<label>Список удалённых подсетей <span data-lan-count></span><textarea name="subnets" spellcheck="false" placeholder="192.168.10.0/24">'+
+  E(c.subnets.join('\n'))+'</textarea></label>'+
+  '<div class="lan-inline"><p class="muted small">Одна IPv4-подсеть на строку. Удаление из списка снимает ограничение для этой подсети.</p>'+
+  '<button type="button" class="quiet" data-lan-import>Добавить сети из Tailscale</button></div></details>'+
+  '<div class="form-actions lan-footer"><button type="submit" class="primary">Проверить и сохранить</button></div>'+
+  '<dialog class="lan-picker" aria-labelledby="lan-picker-title"><div class="dialog-head">'+
+  '<h2 id="lan-picker-title">Устройства Keenetic</h2><button type="button" class="icon-button" data-lan-close aria-label="Закрыть">×</button></div>'+
+  '<label class="lan-picker-search">Поиск по имени или адресу<input type="search" name="device_search" placeholder="Например, ноутбук" autocomplete="off"></label>'+
+  '<p class="muted small lan-picker-status" data-lan-picker-status role="status"></p>'+
+  '<div class="lan-picker-list" data-lan-picker-list></div>'+
   '<details><summary>Ввести IP и MAC вручную</summary><label>IPv4 устройства<input name="manual_ip" placeholder="192.168.1.20" autocomplete="off"></label>'+
   '<label>MAC устройства<input name="manual_mac" placeholder="00:11:22:33:44:55" autocomplete="off"></label>'+
-  '<button type="button" data-lan-manual>Добавить вручную</button></details></div></div>'+
-  '<div class="lan-device-editor" data-lan-editor></div></div>'+
-  '<p class="note" data-lan-all>Указанные подсети доступны всем устройствам этого LAN-сегмента.</p>'+
-  '<details class="lan-advanced"><summary>Сетевой интерфейс</summary><label>Интерфейс LAN<input name="bridge" value="'+
-  E(c.bridge)+'" placeholder="br0" autocomplete="off"></label></details></div>'+
-  '<p class="note" data-lan-off>Политика доступа к удалённым подсетям выключена.</p>'+
-  '<div class="form-actions lan-footer"><button type="submit" class="primary">Проверить правила доступа</button></div></form></section>';
+  '<button type="button" data-lan-manual>Добавить вручную</button></details></dialog></form></section>';
 }
 
 function bindLanAccess(){
  const form=$('#lan-access-form');
  if(!form)return;
  const state=data.lan_access||{mode:'off',bridge:'br0',devices:[],subnets:[]};
- const mode=$('.lan-access select[name="mode"]');
- const {bridge,subnets,manual_ip:manualIp,manual_mac:manualMac}=form.elements;
- const devices=$('[data-lan-devices]',form), editor=$('[data-lan-editor]',form), neighbors=$('#lan-neighbor',form);
+ const {mode,bridge,subnets,manual_ip:manualIp,manual_mac:manualMac,device_search:search}=form.elements;
+ const devices=$('[data-lan-devices]',form), editor=$('[data-lan-editor]',form);
+ const picker=$('.lan-picker',form), pickerList=$('[data-lan-picker-list]',picker), pickerStatus=$('[data-lan-picker-status]',picker);
+ const openPicker=$('[data-lan-open]',form);
  const grants=new Map((state.devices||[]).map(device=>[device,new Set(state.grants?.[device]??state.subnets)]));
  const nearby=new Map();
+ const sources=new Map();
+ for(const peer of data.tailscale.peers){
+  for(const route of peer.PrimaryRoutes||[]){if(peer.HostName)sources.set(route,peer.HostName);}
+ }
+ let requests=0, loading=false, loadFailed=false;
  let active=grants.keys().next().value;
  const routes=()=>[...new Set(subnets.value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean))];
  const name=device=>nearby.get(device)?.name||device.split(' ')[0];
 
  function renderEditor(){
   if(!active){
-   editor.innerHTML='<div class="lan-empty"><h3>Выберите устройство</h3><p class="muted">Добавьте его из списка, затем отметьте нужные подсети.</p></div>';
+   editor.innerHTML='<div class="lan-empty"><h2>Куда разрешить доступ?</h2><p class="muted">Сначала добавьте устройство из Keenetic.</p></div>';
    return;
   }
   const available=routes(), current=grants.get(active);
   const markup=available.map(route=>'<label class="lan-route-option"><input type="checkbox" value="'+E(route)+'" '+
-   (current.has(route)?'checked':'')+'><code>'+E(route)+'</code></label>').join('');
-  editor.innerHTML='<div class="lan-editor-head"><div><h3>'+E(name(active))+'</h3><p class="muted small">'+E(active)+'</p></div>'+
+   (current.has(route)?'checked':'')+'><span class="lan-route-name">'+
+   (sources.has(route)?'<strong>'+E(sources.get(route))+'</strong>':'')+'<code>'+E(route)+'</code></span></label>').join('');
+  editor.innerHTML='<div class="lan-editor-head"><div><h2>Куда разрешить доступ?</h2><p class="muted small">Устройство <strong>'+E(name(active))+'</strong></p></div>'+
    '<button type="button" class="quiet" data-lan-remove>Удалить правило</button></div>'+
-   '<div class="lan-inline"><strong>Разрешённые подсети</strong><div class="actions">'+
-   '<button type="button" class="quiet" data-lan-select>Все</button><button type="button" class="quiet" data-lan-clear>Снять все</button></div></div>'+
-   (markup?'<div class="lan-route-grid">'+markup+'</div>':'<p class="note">Добавьте удалённые подсети в список выше.</p>');
+   '<div class="lan-inline"><span data-lan-chosen role="status"></span><div class="actions">'+
+   '<button type="button" data-lan-select>Разрешить все</button><button type="button" data-lan-clear>Снять все отметки</button></div></div>'+
+   (markup?'<div class="lan-route-grid">'+markup+'</div>':'<p class="note">Добавьте удалённые подсети в дополнительных настройках.</p>');
+  const counter=$('[data-lan-chosen]',editor);
+  function updateCount(){
+   counter.textContent='Выбрано '+available.filter(route=>current.has(route)).length+' из '+available.length;
+  }
+  updateCount();
   $('[data-lan-remove]',editor).onclick=()=>{
    grants.delete(active);
    active=grants.keys().next().value;
    render();
+   ($('[aria-pressed="true"]',devices)||$('[data-lan-open]',form)).focus();
   };
-  $('[data-lan-select]',editor).onclick=()=>{grants.set(active,new Set(available));render();};
-  $('[data-lan-clear]',editor).onclick=()=>{grants.set(active,new Set());render();};
+  $('[data-lan-select]',editor).onclick=()=>{grants.set(active,new Set(available));render();$('[data-lan-select]',editor).focus();};
+  $('[data-lan-clear]',editor).onclick=()=>{grants.set(active,new Set());render();$('[data-lan-clear]',editor).focus();};
   $$('input[type="checkbox"]',editor).forEach(box=>box.onchange=()=>{
    if(box.checked)current.add(box.value);else current.delete(box.value);
+   updateCount();
    renderDevices();
   });
  }
@@ -148,7 +168,7 @@ function bindLanAccess(){
   devices.innerHTML=[...grants].map(([device,list],index)=>
    '<button type="button" class="lan-device" aria-pressed="'+(device===active)+'" data-lan-index="'+index+'">'+
    '<span><strong>'+E(name(device))+'</strong><small>'+E(device.split(' ')[0])+'</small></span>'+
-   '<span class="lan-device-count">'+available.filter(route=>list.has(route)).length+' / '+available.length+'</span></button>').join('');
+   '<span class="lan-device-count">'+available.filter(route=>list.has(route)).length+' из '+available.length+'</span></button>').join('');
   $$('[data-lan-index]',devices).forEach(button=>button.onclick=()=>{
    active=[...grants.keys()][Number(button.dataset.lanIndex)];
    render();
@@ -156,29 +176,53 @@ function bindLanAccess(){
   });
  }
 
+ function renderPicker(){
+  if(!picker.open)return;
+  const query=search.value.trim().toLowerCase();
+  const choices=[...nearby].filter(([,entry])=>[entry.name,entry.ip,entry.mac].some(value=>value.toLowerCase().includes(query)));
+  if(!choices.length){
+   const message=loading?'Загружаем устройства…':loadFailed?'Не удалось загрузить. Закройте окно и откройте его снова.':
+    query?'Совпадений нет. Попробуйте другое имя или адрес.':'Подключите устройство к Keenetic или введите его IP и MAC вручную.';
+   pickerStatus.textContent=message;
+   pickerList.innerHTML='';
+   return;
+  }
+  pickerStatus.textContent='Найдено устройств: '+choices.length;
+  pickerList.innerHTML=choices.map(([device,entry],index)=>
+   '<button type="button" class="lan-picker-device" data-lan-choice="'+index+'"><span><strong>'+E(entry.name)+'</strong>'+
+   '<small>'+E(entry.ip)+' · '+E(entry.mac)+'</small></span><span class="lan-picker-action">'+
+   (grants.has(device)?'Открыть':'Выбрать')+'</span></button>').join('');
+  $$('[data-lan-choice]',pickerList).forEach(button=>button.onclick=()=>{
+   picker.close('selected');
+   add(choices[Number(button.dataset.lanChoice)][0]);
+  });
+ }
+
  function render(){
   const enabled=mode.value!=='off', selected=mode.value==='selected';
-  $('[data-lan-options]',form).hidden=!enabled;
   $('[data-lan-off]',form).hidden=enabled;
   $('[data-lan-selected]',form).hidden=!selected;
   $('[data-lan-all]',form).hidden=mode.value!=='all';
   $('[data-lan-count]',form).textContent=String(routes().length);
+  $('.lan-footer',form).hidden=!enabled&&state.mode==='off';
   if(selected){renderDevices();renderEditor();}
-  const choices=[...nearby].filter(([device])=>!grants.has(device));
-  neighbors.innerHTML='<option value="">'+(choices.length?'Выберите из списка':'Нет доступных устройств')+'</option>'+
-   choices.map(([device,entry])=>'<option value="'+E(device)+'">'+E(entry.name+' · '+entry.ip)+'</option>').join('');
-  $('[data-lan-add]',form).disabled=!choices.length;
+  renderPicker();
  }
 
  async function loadDevices(){
-  const requested=bridge.value.trim();
+  const request=++requests, requested=bridge.value.trim();
+  loading=true;
+  loadFailed=false;
+  renderPicker();
   try{
    const found=await api('/api/lan-devices?bridge='+encodeURIComponent(requested));
-   if(!form.isConnected||bridge.value.trim()!==requested)return;
+   if(request!==requests||!form.isConnected)return;
    nearby.clear();
    for(const entry of found)nearby.set(entry.ip+' '+entry.mac,entry);
-   render();
-  }catch(e){if(form.isConnected)toast(e.message,true);}
+  }catch(e){if(request===requests)loadFailed=true;}
+  finally{
+   if(request===requests&&form.isConnected){loading=false;render();}
+  }
  }
 
  function add(device){
@@ -190,18 +234,37 @@ function bindLanAccess(){
   $('[aria-pressed="true"]',devices)?.focus();
  }
 
- $('[data-lan-add]',form).onclick=()=>add(neighbors.value);
+ openPicker.onclick=()=>{
+  search.value='';
+  picker.returnValue='';
+  picker.showModal();
+  search.focus();
+  renderPicker();
+  loadDevices();
+ };
+ $('[data-lan-close]',form).onclick=()=>picker.close();
+ picker.onkeydown=event=>{
+  if(event.key==='Escape'){event.preventDefault();picker.close();}
+ };
+ picker.addEventListener('close',()=>{if(picker.returnValue!=='selected')openPicker.focus();});
+ search.oninput=renderPicker;
+ $$('[data-lan-enable]',form).forEach(button=>button.onclick=()=>{
+  mode.value='selected';
+  render();
+  $('[data-lan-open]',form).focus();
+  loadDevices();
+ });
  $('[data-lan-manual]',form).onclick=()=>{
   const ip=manualIp.value.trim(), mac=manualMac.value.trim().toLowerCase().replace(/-/g,':');
   if(!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip)||!/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(mac)){
    toast('Введите IPv4 и MAC устройства.',true);
    return;
   }
+  picker.close('selected');
   add(ip+' '+mac);
   manualIp.value=manualMac.value='';
  };
- const advertised=[...new Set(data.tailscale.peers.flatMap(peer=>peer.PrimaryRoutes||[]))]
-  .filter(route=>/^(?:\d{1,3}\.){3}\d{1,3}\/(?:[1-9]|[12]\d|3[0-2])$/.test(route));
+ const advertised=[...sources.keys()].filter(route=>/^(?:\d{1,3}\.){3}\d{1,3}\/(?:[1-9]|[12]\d|3[0-2])$/.test(route));
  const importButton=$('[data-lan-import]',form);
  importButton.hidden=!advertised.length;
  importButton.onclick=()=>{subnets.value=[...new Set([...routes(),...advertised])].join('\n');render();};
@@ -210,6 +273,7 @@ function bindLanAccess(){
  subnets.onchange=render;
  form.onsubmit=e=>{
   e.preventDefault();
+  if(picker.open)return;
   const available=routes();
   const params={mode:mode.value,bridge:bridge.value.trim(),subnets:available,devices:[]};
   if(mode.value==='selected'){
@@ -222,7 +286,7 @@ function bindLanAccess(){
  if(mode.value==='selected')loadDevices();
 }
 
-const renderers={overview,exit:exitView,peers:peersView,routes:routesView,native:nativeView,diagnostics:diagnosticsView,logs:logsView,backups:backupsView,system:()=>systemView()+panelAccessView()};
+const renderers={overview,exit:exitView,peers:peersView,routes:routesView,'lan-access':lanAccessView,native:nativeView,diagnostics:diagnosticsView,logs:logsView,backups:backupsView,system:()=>systemView()+panelAccessView()};
 async function render(){if(!data)return;page=location.hash.slice(1)||'overview';if(!pages[page])page='overview';$('#page-title').textContent=pages[page];$$('#nav a').forEach(a=>{a.classList.toggle('active',a.dataset.page===page);if(a.dataset.page===page)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});$('#main').className='page-'+page;$('#main').innerHTML=renderers[page]();decorateFields($('#main'));bindView();bindPanelAccess();bindLanAccess();if(page==='native'&&!nativeData){try{nativeData=await api('/api/native');if(page==='native')render()}catch(e){toast(e.message,true)}}if(page==='exit')loadEgress();if(page==='logs')loadLogs();if(page==='backups')loadBackups();if(page==='system')loadPanelSettings()}
 async function refresh(manual=false){if(refreshBusy||credentialsBusy||!session.authenticated)return;refreshBusy=true;try{data=await api('/api/dashboard');status();if(manual){nativeData=null;await render();toast('Данные обновлены')}else if(['overview','peers'].includes(page)&&!$('#main form:focus-within')&&!$('#peer-search:focus')&&!$('#confirm').open)await render()}catch(e){$('#live-state').textContent='Нет ответа';$('#live-state').className='status-badge warn';if(manual)toast(e.message,true)}finally{refreshBusy=false}}
 async function plan(action,params={}){try{pendingPlan=await api('/api/actions/plan',{action,params});$('#confirm-title').textContent='Проверка изменений';$('#confirm-description').textContent=pendingPlan.message;$('#confirm-changes').innerHTML=pendingPlan.changes.length?pendingPlan.changes.map(c=>`<div class="change-row"><strong>${E(labels[c.name]||c.name)}</strong><span class="before">${E(formatValue(c.before))}</span><span class="after">→ ${E(formatValue(c.after))}</span></div>`).join(''):'<div class="note">Изменений не требуется.</div>';$('#confirm-commands').textContent=pendingPlan.commands.map(x=>Array.isArray(x)?x.join(' '):x).join('\n');$('#command-details').hidden=!pendingPlan.commands.length;$('#confirm-apply').textContent=pendingPlan.changes.length?'Применить':'Подтвердить проверку';$('#confirm').showModal()}catch(e){toast(e.message,true)}}
