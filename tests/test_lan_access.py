@@ -48,3 +48,34 @@ class LanAccessTests(unittest.TestCase):
         self.assertFalse(config["devices"])
         self.assertEqual(self.access.route_rules(config),
                          {("from", "all", "to", "192.168.51.0/24", "iif", "br0", "lookup", "52")})
+
+    def test_individual_routes_are_used_in_filter_nat_and_policy_routing(self):
+        a = self.selection["devices"][0]
+        b = "192.168.31.23 00:01:02:03:04:06"
+        net_a, net_b = "192.168.51.0/24", "192.168.52.0/24"
+        config = self.access.normalize({**self.selection, "devices": [a, b],
+                                        "subnets": [net_a, net_b], "grants": {a: [net_a], b: [net_b]}})
+        routes = self.access.route_rules(config)
+        self.assertEqual({(rule[1], rule[3]) for rule in routes},
+                         {("192.168.31.22", net_a), ("192.168.31.23", net_b)})
+        for table, chains in (("mangle", ("TSKL_PRE", "TSKL_PRE_ACCESS")),
+                              ("filter", ("TSKL_FWD", "TSKL_FWD_ACCESS")), ("nat", ("TSKL_NAT",))):
+            for rule in self.access.chain_rules(table, config, chains):
+                self.assertFalse(" -s 192.168.31.22 " in rule and f" -d {net_b} " in rule)
+                self.assertFalse(" -s 192.168.31.23 " in rule and f" -d {net_a} " in rule)
+
+    def test_empty_grant_keeps_the_cidr_guard_and_has_no_forward_rule(self):
+        device = self.selection["devices"][0]
+        config = self.access.normalize({**self.selection, "grants": {device: []}})
+        self.assertFalse(self.access.route_rules(config))
+        result = self.access.chain_rules("mangle", config, ("TSKL_PRE", "TSKL_PRE_ACCESS"))
+        self.assertEqual(result, ["-A TSKL_PRE -i br0 -d 192.168.51.0/24 -j TSKL_PRE_ACCESS",
+                                  "-A TSKL_PRE_ACCESS -j DROP"])
+
+    def test_individual_rules_reject_unknown_and_overlapping_routes(self):
+        device = self.selection["devices"][0]
+        with self.assertRaises(Error):
+            self.access.normalize({**self.selection, "grants": {device: ["192.168.61.0/24"]}})
+        with self.assertRaises(Error):
+            self.access.normalize({**self.selection, "subnets": ["192.168.0.0/16", "192.168.51.0/24"],
+                                   "grants": {device: ["192.168.51.0/24"]}})

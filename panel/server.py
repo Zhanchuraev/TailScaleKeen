@@ -308,6 +308,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = service.egress.status()
             elif path == "/api/devices":
                 data = service.devices.list()
+            elif path == "/api/lan-devices":
+                data = service.lan_access.local_devices(query.get("bridge", ["br0"])[0])
             elif path == "/api/panel-settings":
                 data = {
                     "username": self.app.auth_record().get("username", ""),

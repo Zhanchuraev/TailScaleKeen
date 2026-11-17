@@ -87,3 +87,102 @@ button.copy-address:hover{background:color-mix(in srgb,var(--blue) 9%,var(--bg))
 .address-line.secondary{color:var(--muted);font-size:12px;line-height:18px}
 .address-line.secondary button.copy-address{width:20px;min-width:20px;height:18px;min-height:18px;padding:1px 3px}
 .address-line.secondary button.copy-address .icon{width:12px;height:14px}
+
+.lan-access [hidden] { display: none !important; }
+.lan-heading, .lan-inline, .lan-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+}
+.lan-heading { padding-bottom: 17px; }
+.lan-heading p, .lan-editor-head p { margin: 5px 0 0; }
+.lan-mode { min-width: 180px; margin: 0; }
+.lan-mode select { margin-top: 6px; }
+.lan-catalog, .lan-advanced {
+  margin: 0;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+.lan-catalog summary, .lan-advanced summary { color: var(--text); font-weight: 600; }
+.lan-catalog summary span {
+  margin-left: .55em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  color: var(--blue);
+  background: var(--raised);
+  font-variant-numeric: tabular-nums;
+}
+.lan-catalog textarea { min-height: 84px; max-height: 190px; }
+.lan-advanced input { max-width: 160px; }
+.lan-device-area {
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(0, 3fr);
+  gap: 0;
+  margin: 4px 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.lan-device-list, .lan-device-editor { min-width: 0; padding: 16px; }
+.lan-device-list { background: var(--raised); border-radius: 9px 0 0 9px; }
+.lan-device-list > h3, .lan-editor-head h3 { margin: 0 0 8px; }
+.lan-device-editor { border-left: 1px solid var(--line); }
+.lan-device {
+  width: 100%;
+  min-height: 44px;
+  margin: 3px 0 0;
+  padding: 7px 9px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+}
+.lan-device[aria-pressed="true"] {
+  background: var(--surface);
+  border-color: var(--blue);
+  box-shadow: inset 3px 0 var(--blue);
+}
+.lan-device strong, .lan-device small { display: block; overflow-wrap: anywhere; }
+.lan-device small, .lan-device-count { color: var(--muted); }
+.lan-device-count { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; }
+.lan-add { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.lan-add select { width: 100%; margin: 0 0 8px; }
+.lan-add details { margin-top: 10px; }
+.lan-route-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr));
+  gap: 6px;
+  margin-top: 9px;
+}
+.lan-route-option {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 0;
+  padding: 6px 8px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  cursor: pointer;
+}
+.lan-route-option:has(:checked) { border-color: var(--blue); background: var(--raised); }
+.lan-route-option input { flex: none; margin: 0; }
+.lan-route-option code { font-size: 12px; white-space: nowrap; }
+.lan-access button:focus-visible, .lan-route-option:focus-within {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.lan-empty { min-height: 125px; display: grid; align-content: center; }
+.lan-empty p { margin: 0; }
+.lan-footer { margin-top: 10px; }
+@media (max-width: 700px) {
+  .lan-device-area { grid-template-columns: minmax(0, 1fr); }
+  .lan-device-list { border-radius: 9px 9px 0 0; }
+  .lan-device-editor { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (max-width: 480px) {
+  .lan-route-grid { grid-template-columns: minmax(0, 1fr); }
+}

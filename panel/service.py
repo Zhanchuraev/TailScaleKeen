@@ -217,12 +217,19 @@ class Service:
             existing = self.lan_access.current()
             wanted = self.lan_access.plan(params, s)
             lan_revision = existing
+            modes = {"off": "Выключено", "selected": "По устройствам", "all": "Весь сегмент"}
             changes = [
-                {"name": "Доступ из LAN", "before": existing["mode"], "after": wanted["mode"]},
-                {"name": "Устройства", "before": existing["devices"], "after": wanted["devices"]},
+                {"name": "Доступ из LAN", "before": modes[existing["mode"]], "after": modes[wanted["mode"]]},
+                {"name": "Сегмент LAN", "before": existing["bridge"], "after": wanted["bridge"]},
                 {"name": "Подсети", "before": existing["subnets"], "after": wanted["subnets"]},
             ]
-            message = "Правила действуют для указанного LAN-интерфейса. В режиме выбора остальные устройства этого сегмента не смогут обращаться к указанным подсетям через роутер."
+            previous_grants = self.lan_access.grants(existing)
+            grants = self.lan_access.grants(wanted)
+            changes.extend({"name": device, "before": previous_grants.get(device, []),
+                            "after": grants.get(device, [])}
+                           for device in sorted(previous_grants.keys() | grants.keys()))
+            changes = [change for change in changes if change["before"] != change["after"]]
+            message = "При индивидуальном доступе каждое устройство получает только отмеченные для него подсети."
         elif action == "settings":
             if self.lan_access.current()["mode"] != "off" and (
                 params.get("accept_routes") is False or params.get("exit_node")

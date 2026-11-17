@@ -27,7 +27,8 @@ class LanAccess:
         return read_json(self.path, {"mode": "off", "bridge": "br0", "devices": [], "subnets": []})
 
     def normalize(self, fields):
-        if set(fields) != {"mode", "bridge", "devices", "subnets"}:
+        required = {"mode", "bridge", "devices", "subnets"}
+        if set(fields) - {"grants"} != required:
             raise Error("Укажите режим, интерфейс LAN, устройства и подсети")
         mode = fields["mode"]
         if mode not in ("off", "selected", "all"):
@@ -62,8 +63,47 @@ class LanAccess:
             raise Error("Используйте формат «IPv4 MAC» и корректные IPv4-подсети") from None
         if len({x.split()[0] for x in entries}) != len(entries):
             raise Error("Один IP-адрес должен соответствовать одному устройству")
-        return {"mode": mode, "bridge": bridge, "devices": sorted(entries),
-                "subnets": [str(n) for n in sorted(nets)]}
+        ordered_nets = sorted(nets)
+        config = {"mode": mode, "bridge": bridge, "devices": sorted(entries),
+                  "subnets": [str(n) for n in ordered_nets]}
+        if mode == "selected" and "grants" in fields:
+            grants = fields["grants"]
+            if not isinstance(grants, dict) or set(grants) != set(entries):
+                raise Error("Укажите список разрешённых подсетей для каждого устройства")
+            if any(a.overlaps(b) for i, a in enumerate(ordered_nets) for b in ordered_nets[i + 1:]):
+                raise Error("Для индивидуальных правил укажите непересекающиеся подсети")
+            available = set(config["subnets"])
+            for routes in grants.values():
+                if (not isinstance(routes, list) or len(routes) > 64
+                    or any(not isinstance(route, str) or route not in available for route in routes)):
+                    raise Error("Разрешения должны ссылаться на подсети из списка выше")
+            config["grants"] = {row: sorted(set(grants[row])) for row in config["devices"]}
+        return config
+
+    @staticmethod
+    def grants(config):
+        if config["mode"] != "selected":
+            return {}
+        return config.get("grants", dict.fromkeys(config["devices"], config["subnets"]))
+
+    def neighbors(self, bridge):
+        if not re.fullmatch(r"br[0-9]{1,3}", bridge):
+            raise Error("Укажите LAN-интерфейс, например br0")
+        output = self.runner.run(["ip", "-4", "neigh", "show", "dev", bridge]).stdout
+        pattern = r"^(\d+\.\d+\.\d+\.\d+)\s+lladdr\s+((?:[a-f0-9]{2}:){5}[a-f0-9]{2})"
+        return dict(re.findall(pattern, output.lower(), re.M))
+
+    def local_devices(self, bridge):
+        neighbors = self.neighbors(bridge)
+        hotspot = self.runner.run(["ndmc", "-c", "show ip hotspot"], check=False).stdout
+        names = {}
+        for entry in re.split(r"(?m)^\s*host:\s*$", hotspot):
+            mac = re.search(r"(?m)^\s*mac:\s*(\S+)\s*$", entry)
+            name = re.search(r"(?m)^\s*name:[ \t]+([^\r\n]+)", entry)
+            if mac and name:
+                names[mac[1].lower()] = name[1].strip()[:80]
+        return [{"ip": ip, "mac": mac, "name": names.get(mac, ip)}
+                for ip, mac in sorted(neighbors.items(), key=lambda row: ipaddress.IPv4Address(row[0]))][:128]
 
     def verify_selection(self, config, snapshot):
         if snapshot["backend_state"] != "Running" or not snapshot["online"]:
@@ -83,13 +123,15 @@ class LanAccess:
         lan = [iface.network for dev, iface in pairs if dev == bridge]
         if not lan:
             raise Error("У выбранного интерфейса LAN отсутствует IPv4")
-        neighbors = self.runner.run(["ip", "-4", "neigh", "show", "dev", bridge]).stdout
+        neighbors = self.neighbors(bridge)
+        current = self.current()
+        saved = current["devices"] if current["bridge"] == bridge else []
         for row in config["devices"]:
             addr, mac = row.split()
             if not any(ipaddress.IPv4Address(addr) in network for network in lan):
                 raise Error("Устройство находится за другим интерфейсом: " + addr)
-            observed = re.search(r"^" + re.escape(addr) + r"\s+lladdr\s+([0-9a-f:]+)", neighbors, re.M | re.I)
-            if not observed or observed[1].lower() != mac:
+            observed = neighbors.get(addr)
+            if observed != mac and (observed or row not in saved):
                 raise Error("Роутер пока не подтвердил пару IP и MAC для " + addr)
         return {
             "zero_tier_sources": sorted(str(iface.ip) for dev, iface in pairs
@@ -99,6 +141,8 @@ class LanAccess:
 
     def plan(self, params, snapshot):
         config = self.normalize(params)
+        if config["mode"] == "selected" and "grants" not in config and "grants" in self.current():
+            raise Error("Обновите страницу и проверьте индивидуальные разрешения", 409)
         if config["mode"] != "off":
             config.update(self.verify_selection(config, snapshot))
         return config
@@ -106,9 +150,12 @@ class LanAccess:
     def route_rules(self, config):
         if config["mode"] == "off":
             return set()
-        sources = ["all"] if config["mode"] == "all" else [row.split()[0] for row in config["devices"]]
+        if config["mode"] == "all":
+            pairs = [("all", net) for net in config["subnets"]]
+        else:
+            pairs = [(row.split()[0], net) for row, nets in self.grants(config).items() for net in nets]
         return {("from", source, "to", subnet, "iif", config["bridge"], "lookup", "52")
-                for source in sources for subnet in config["subnets"]}
+                for source, subnet in pairs}
 
     def management_rules(self, config):
         return {("from", str(ipaddress.IPv4Address(addr)), "lookup", "main")
@@ -156,22 +203,25 @@ class LanAccess:
 
     def chain_rules(self, table, config, chains):
         bridge = config["bridge"]
-        chosen = [row.split() for row in config["devices"]]
+        chosen = [(row.split(), nets) for row, nets in self.grants(config).items()]
         if config["mode"] == "all":
-            sources = [(["-s", net], net) for net in config["lan_sources"]]
+            sources = [(["-s", net], net, config["subnets"]) for net in config["lan_sources"]]
         else:
-            sources = [(["-s", ip, "-m", "mac", "--mac-source", mac], ip) for ip, mac in chosen]
+            sources = [(["-s", ip, "-m", "mac", "--mac-source", mac], ip, nets) for (ip, mac), nets in chosen]
         head = chains[0]
         if table == "nat":
             return [" ".join([f"-A {head} -o {self.tun}", "-s", ip,
                               "-d", net, "-j MASQUERADE"])
-                    for net in config["subnets"] for _, ip in sources]
+                    for _, ip, nets in sources for net in nets]
         guard = chains[1]
         rules = [f"-A {head} -i {bridge} -d {net} -j {guard}" for net in config["subnets"]]
         if table == "filter":
             rules += [f"-A {head} -i {self.tun} -o {bridge} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"]
         allow = ["-o", self.tun] if table == "filter" else []
-        rules += [" ".join([f"-A {guard}", *match, *allow, "-j ACCEPT"]) for match, _ in sources]
+        for match, _, nets in sources:
+            # The parent chain already checks the catalog. Use one rule for a full grant.
+            limits = [[]] if set(nets) == set(config["subnets"]) else [["-d", net] for net in nets]
+            rules += [" ".join([f"-A {guard}", *match, *limit, *allow, "-j ACCEPT"]) for limit in limits]
         return rules + [f"-A {guard} -j DROP"]
 
     def payload(self, config, previous):
