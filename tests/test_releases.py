@@ -98,11 +98,36 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(task.active());self.assertNotIn('token',result);self.assertNotIn('files',result)
 
     def test_bad_health_rolls_back_code_launchers_and_config(self):
-        state,target,task,keys=self.prepare_root();config=(state/'config.json').read_bytes();calls=[]
-        result=apply_staged(state,'test-token',str(self.root),calls.append,lambda port,version,configured:version=='0.9.0')
+        state,target,task,keys=self.prepare_root()
+        config_path = state/'config.json'
+        write_json(config_path, {**read_json(config_path), 'bind': '192.0.2.17'})
+        config=config_path.read_bytes();calls=[]
+        probes = []
+        def probe(host, port, version, configured):
+            probes.append((host, port, version, configured))
+            return version == '0.9.0'
+        result=apply_staged(state,'test-token',str(self.root),calls.append,probe)
         self.assertEqual(result['state'],'rolled_back');self.assertEqual((target/'old-code').read_text(),'previous')
+        self.assertEqual(probes, [('192.0.2.17', 8192, VERSION, True), ('192.0.2.17', 8192, '0.9.0', True)])
         self.assertEqual((state/'config.json').read_bytes(),config);self.assertEqual(keys.read_bytes(),b'identity-sentinel')
         self.assertFalse((self.root/'opt/bin/tailscalekeen').exists());self.assertEqual(calls,['stop','start','stop','start'])
+
+    def test_staging_failure_keeps_panel_serving(self):
+        state, target, _, _ = self.prepare_root()
+        calls = []
+        with patch('panel.panel_update.shutil.copytree', side_effect=OSError('full disk')):
+            result = apply_staged(state, 'test-token', str(self.root), calls.append)
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(calls, [])
+        self.assertTrue((target/'old-code').is_file())
+
+    def test_client_archive_streams_both_binaries_in_either_order(self):
+        from panel.install import extract_client
+        contents = {'tailscale': b'cli', 'tailscaled': b'daemon' * 100000}
+        dest = self.root / 'candidate'
+        archive = blob({'release/tailscaled': contents['tailscaled'], 'release/extra': b'', 'release/tailscale': contents['tailscale']})
+        extract_client(archive, dest)
+        self.assertEqual({file.name: file.read_bytes() for file in dest.iterdir()}, contents)
 
     def test_staged_tampering_stops_before_service(self):
         state,target,task,keys=self.prepare_root();(task.root/'candidate/panel/core.py').write_text('tampered')

@@ -153,6 +153,35 @@ class EgressTests(unittest.TestCase):
         )
         self.assertFalse(any("OUTPUT" in c for c in self.r.calls))
 
+    def test_lan_guards_precede_exit_before_general_integration_without_rebuild(self):
+        choice = self.e.resolve("policy:Policy6")
+        spec = self.e.specs(choice)[0]
+        hold = "-A FORWARD -i opkgtun0 -m comment --comment tailscale-panel-egress-hold -j TSP_EXIT_HOLD"
+        tables = {
+            ("mangle", "PREROUTING"): ["-A PREROUTING -j TSKL_PRE"],
+            ("filter", "FORWARD"): [hold, "-A FORWARD -j TSKL_FWD", "-A FORWARD -j TSK_FORWARD"],
+            ("nat", "POSTROUTING"): ["-A POSTROUTING -j TSKL_NAT", "-A POSTROUTING -j TSK_SNAT"],
+            ("nat", "PREROUTING"): [],
+        }
+        original = self.e.call
+        def call(args, check=True):
+            if args[0] == "iptables" and args[3] in ("-I", "-S"):
+                rows = tables[(args[2], args[4])]
+                if args[3] == "-I":
+                    rows.insert(int(args[5]) - 1, " ".join(["-A", args[4], *args[6:]]))
+                return subprocess.CompletedProcess(args, 0, "\n".join(rows), "")
+            return original(args, check)
+        with patch.object(self.e, "call", side_effect=call):
+            self.e.install_rules(choice, [spec])
+            forward = tables[("filter", "FORWARD")]
+            self.assertEqual(forward.pop(0), hold)
+            self.assertEqual(forward[0], "-A FORWARD -j TSKL_FWD")
+            self.assertTrue(self.e.anchors_ready("iptables", "mangle", "PREROUTING", [CHAINS["mangle"]]))
+            self.assertTrue(self.e.anchors_ready("iptables", "nat", "POSTROUTING", [CHAINS["nat"]]))
+            self.assertTrue(self.e.anchors_ready("iptables", "filter", "FORWARD", ["ACCEPT", CHAINS["filter"]]))
+            forward.insert(1, "-A FORWARD -j TSK_FORWARD")
+            self.assertFalse(self.e.anchors_ready("iptables", "filter", "FORWARD", ["ACCEPT", CHAINS["filter"]]))
+
     def test_private_lan_overlay_and_connected_routes_bypass_egress(self):
         self.assertIn("192.168.0.0/16", self.e.excluded(4))
         self.assertIn("100.64.0.0/10", self.e.excluded(4))

@@ -1,6 +1,6 @@
 """Independent local account and root-only first-run recovery."""
 
-import hashlib, hmac, pathlib, re, secrets, contextlib
+import hashlib, hmac, json, pathlib, re, secrets, contextlib
 from .core import Error, read_json, write_json, operation_lock
 
 
@@ -69,7 +69,16 @@ class Accounts:
         self.path = self.state / "auth.json"
 
     def read(self):
-        return read_json(self.path)
+        try:
+            account = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            raise Error("Не удалось прочитать учётную запись панели. Проверьте файл auth.json через SSH.", 503) from None
+        if not isinstance(account, dict) or not all(isinstance(account.get(k), str) and account[k]
+                                                   for k in ("username", "password_hash")):
+            raise Error("Повреждена учётная запись панели. Проверьте файл auth.json через SSH.", 503)
+        return account
 
     def revision(self):
         try:
@@ -83,7 +92,7 @@ class Accounts:
             self.reset(locked=locked)
             return
         if (
-            not self.read().get("password_hash")
+            not self.path.exists()
             and not (self.state / "account-state.json").exists()
         ):
             self.reset(locked=locked)

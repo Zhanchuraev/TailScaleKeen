@@ -106,6 +106,27 @@ class AuditServiceTests(unittest.TestCase):
         with self.assertRaises(Error): self.service.plan('update_panel', {})
         self.assertEqual(len(self.service.plans), 32)
 
+    def test_stale_lan_editor_is_rejected_before_planning(self):
+        revision = self.service.dashboard()["lan_access_revision"]
+        write_json(self.service.state/'lan-access.json', {'mode':'all','bridge':'br0','devices':[],'subnets':[]})
+        with self.assertRaises(Error) as caught:
+            self.service.plan('lan_access', {}, lan_revision=revision)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertFalse(self.service.plans)
+
+    def test_restore_rechecks_the_lan_constraint_after_preview(self):
+        service = self.service
+        service.runner.prefs['RouteAll'] = False
+        backup = service.backup_settings()
+        service.runner.prefs['RouteAll'] = True
+        plan = service.plan('restore', {'backup': backup['id']})
+        write_json(service.state/'lan-access.json', {'mode':'all','bridge':'br0','devices':[],'subnets':[]})
+        with self.assertRaises(Error):
+            service.plan('restore', {'backup': backup['id']})
+        with patch.object(service.jobs, 'start', lambda label, work: work(lambda _: None)), self.assertRaises(Error):
+            service.apply(plan['id'])
+        self.assertFalse(any('set' in call for call in service.runner.calls))
+
     def test_preference_change_while_worker_waits_prevents_write(self):
         plan = self.service.plan('settings', {'accept_dns': True})
         def delayed_worker(label, work):

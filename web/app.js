@@ -1,7 +1,8 @@
 'use strict';
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const E=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let session={}, data=null, page='overview', nativeData=null, query='', activeJob=null, pendingPlan=null, refreshBusy=false, credentialsBusy=false, activeDevice=null;
+let session={}, data=null, page='overview', nativeData=null, query='', activeJob=null, pendingPlan=null, refreshBusy=null, credentialsBusy=false, activeDevice=null;
+let lanDraft=null, preparingPlan=false;
 const pages={overview:'Системный монитор',exit:'Выход в интернет',peers:'Клиенты',routes:'Подсети и DNS','lan-access':'Доступ устройств',native:'Подключение Keenetic',diagnostics:'Диагностика',logs:'Журналы',backups:'Резервные копии',system:'Клиент и панель'};
 const labels={accept_dns:'Принимать DNS с сервера',accept_routes:'Принимать маршруты подсетей',allow_lan:'Доступ к своей LAN при использовании внешнего Exit node',shields_up:'Блокировать входящие подключения',ssh:'Tailscale SSH',webclient:'Встроенный веб-клиент',snat:'SNAT подсетей',stateful:'Фильтрация соединений'};
 async function api(url,body){
@@ -113,9 +114,11 @@ function lanAccessView(){
 }
 
 function bindLanAccess(){
+ lanDraft=null;
  const form=$('#lan-access-form');
  if(!form)return;
  const state=data.lan_access||{mode:'off',bridge:'br0',devices:[],subnets:[]};
+ const revision=data.lan_access_revision;
  const {mode,subnets,manual_ip:manualIp,manual_mac:manualMac,device_search:search}=form.elements;
  const devices=$('[data-lan-devices]',form), editor=$('[data-lan-editor]',form);
  const picker=$('.lan-picker',form), pickerList=$('[data-lan-picker-list]',picker), pickerStatus=$('[data-lan-picker-status]',picker);
@@ -131,7 +134,7 @@ function bindLanAccess(){
  for(const peer of data.tailscale.peers){
   for(const route of peer.PrimaryRoutes||[]){if(peer.HostName)sources.set(route,peer.HostName);}
  }
- let requests=0, loading=false, loadFailed=false;
+ let deviceQuery=null, deviceRequest=null, loading=false, loadFailed=false;
  let active=grants.keys().next().value;
  const routes=()=>[...new Set(subnets.value.split(/\r?\n/).map(value=>value.trim()).filter(Boolean))];
  const name=device=>nearby.get(device)?.name||device.split(' ')[0];
@@ -147,7 +150,7 @@ function bindLanAccess(){
    if(box.checked)bridges.add(box.value);else bridges.delete(box.value);
    if(!visibleDevices().includes(active))active=visibleDevices()[0];
    render();
-   loadDevices();
+   if(mode.value==='selected')loadDevices();
   });
  }
 
@@ -157,7 +160,13 @@ function bindLanAccess(){
    if(!form.isConnected)return;
    for(const segment of found)segments.set(segment.id,segment);
   }catch(e){segmentLoadFailed=true;}
-  if(form.isConnected){renderSegments();render();}
+  if(form.isConnected){
+   const focused=segmentList.contains(document.activeElement)?document.activeElement.value:null;
+   renderSegments();
+   if(focused)$$('input',segmentList).find(box=>box.value===focused)?.focus();
+   updateInventory();
+   if(segmentLoadFailed)segmentStatus.textContent='Не удалось загрузить список сегментов. Обновите страницу.';
+  }
  }
 
  function renderEditor(){
@@ -169,7 +178,7 @@ function bindLanAccess(){
   const markup=available.map(route=>'<label class="lan-route-option"><input type="checkbox" value="'+E(route)+'" '+
    (current.has(route)?'checked':'')+'><span class="lan-route-name">'+
    (sources.has(route)?'<strong>'+E(sources.get(route))+'</strong>':'')+'<code>'+E(route)+'</code></span></label>').join('');
-  editor.innerHTML='<div class="lan-editor-head"><div><h2>Куда разрешить доступ?</h2><p class="muted small">Устройство <strong>'+E(name(active))+'</strong></p></div>'+
+  editor.innerHTML='<div class="lan-editor-head"><div><h2>Куда разрешить доступ?</h2><p class="muted small">Устройство <strong data-lan-editor-name>'+E(name(active))+'</strong></p></div>'+
    '<button type="button" class="quiet" data-lan-remove>Удалить правило</button></div>'+
    '<div class="lan-inline"><span data-lan-chosen role="status"></span><div class="actions">'+
    '<button type="button" data-lan-select>Разрешить все</button><button type="button" data-lan-clear>Снять все отметки</button></div></div>'+
@@ -211,6 +220,7 @@ function bindLanAccess(){
 
  function renderPicker(){
   if(!picker.open)return;
+  const focused=document.activeElement?.dataset.lanDevice;
   const query=search.value.trim().toLowerCase();
   const choices=[...nearby].filter(([,entry])=>bridges.has(entry.bridge)&&
    [entry.name,entry.ip,entry.mac,segmentName(entry.bridge)].some(value=>value.toLowerCase().includes(query)));
@@ -219,11 +229,12 @@ function bindLanAccess(){
     query?'Совпадений нет. Попробуйте другое имя или адрес.':'Подключите устройство к Keenetic или введите его IP и MAC вручную.';
    pickerStatus.textContent=message;
    pickerList.innerHTML='';
+   if(focused)search.focus();
    return;
   }
   pickerStatus.textContent='Найдено устройств: '+choices.length;
   pickerList.innerHTML=choices.map(([device,entry],index)=>
-   '<button type="button" class="lan-picker-device" data-lan-choice="'+index+'"><span><strong>'+E(entry.name)+'</strong>'+
+   '<button type="button" class="lan-picker-device" data-lan-choice="'+index+'" data-lan-device="'+E(device)+'"><span><strong>'+E(entry.name)+'</strong>'+
    '<small>'+E(entry.ip+' · '+entry.mac)+'</small><small>'+E(segmentName(entry.bridge))+'</small></span><span class="lan-picker-action">'+
    (grants.has(device)?'Открыть':'Выбрать')+'</span></button>').join('');
   $$('[data-lan-choice]',pickerList).forEach(button=>button.onclick=()=>{
@@ -231,6 +242,18 @@ function bindLanAccess(){
    const [device,entry]=choices[Number(button.dataset.lanChoice)];
    add(device,entry.bridge);
   });
+  if(focused)($$('[data-lan-choice]',pickerList).find(button=>button.dataset.lanDevice===focused)||search).focus();
+ }
+
+ function updateInventory(){
+  if(mode.value==='selected'){
+   const focused=devices.contains(document.activeElement);
+   renderDevices();
+   if(focused)$('[aria-pressed="true"]',devices)?.focus();
+   const label=$('[data-lan-editor-name]',editor);
+   if(label&&active)label.textContent=name(active);
+  }
+  renderPicker();
  }
 
  function render(){
@@ -252,21 +275,25 @@ function bindLanAccess(){
  }
 
  async function loadDevices(){
-  const request=++requests;
-  if(!bridges.size){nearby.clear();loading=false;render();return;}
   const params=new URLSearchParams();
   for(const bridge of bridges)params.append('bridge',bridge);
+  const query=params.toString();
+  if(deviceRequest&&deviceQuery===query)return;
+  deviceQuery=query;
+  if(!bridges.size){deviceRequest=null;nearby.clear();loading=false;updateInventory();return;}
   loading=true;
   loadFailed=false;
   renderPicker();
+  const request=api('/api/lan-devices?'+query);
+  deviceRequest=request;
   try{
-   const found=await api('/api/lan-devices?'+params);
-   if(request!==requests||!form.isConnected)return;
+   const found=await request;
+   if(request!==deviceRequest||!form.isConnected)return;
    nearby.clear();
    for(const entry of found)nearby.set(entry.ip+' '+entry.mac,entry);
-  }catch(e){if(request===requests)loadFailed=true;}
+  }catch(e){if(request===deviceRequest)loadFailed=true;}
   finally{
-   if(request===requests&&form.isConnected){loading=false;render();}
+   if(request===deviceRequest&&form.isConnected){deviceRequest=null;loading=false;updateInventory();}
   }
  }
 
@@ -323,16 +350,21 @@ function bindLanAccess(){
  importButton.onclick=()=>{subnets.value=[...new Set([...routes(),...advertised])].join('\n');render();};
  mode.onchange=()=>{render();if(mode.value==='selected')loadDevices();};
  subnets.onchange=render;
- form.onsubmit=e=>{
-  e.preventDefault();
-  if(picker.open)return;
+ function paramsForPlan(){
   const available=routes();
-  const params={mode:mode.value,bridges:[...bridges],subnets:available,devices:[]};
+  const params={mode:mode.value,bridges:[...bridges].sort(),subnets:available,devices:[]};
   if(mode.value==='selected'){
-   params.devices=visibleDevices();
+   params.devices=visibleDevices().sort();
    params.grants=Object.fromEntries(params.devices.map(device=>[device,available.filter(route=>grants.get(device).has(route))]));
   }
-  plan('lan_access',params);
+  return params;
+ }
+ const snapshot=()=>JSON.stringify(paramsForPlan());
+ const initial=snapshot();
+ lanDraft={snapshot,changed:()=>snapshot()!==initial};
+ form.onsubmit=e=>{
+  e.preventDefault();
+  if(!picker.open)plan('lan_access',paramsForPlan(),revision);
  };
  renderSegments();
  render();
@@ -342,11 +374,98 @@ function bindLanAccess(){
 
 const renderers={overview,exit:exitView,peers:peersView,routes:routesView,'lan-access':lanAccessView,native:nativeView,diagnostics:diagnosticsView,logs:logsView,backups:backupsView,system:()=>systemView()+panelAccessView()};
 async function render(){if(!data)return;page=location.hash.slice(1)||'overview';if(!pages[page])page='overview';$('#page-title').textContent=pages[page];$$('#nav a').forEach(a=>{a.classList.toggle('active',a.dataset.page===page);if(a.dataset.page===page)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});$('#main').className='page-'+page;$('#main').innerHTML=renderers[page]();decorateFields($('#main'));bindView();bindPanelAccess();bindLanAccess();if(page==='native'&&!nativeData){try{nativeData=await api('/api/native');if(page==='native')render()}catch(e){toast(e.message,true)}}if(page==='exit')loadEgress();if(page==='logs')loadLogs();if(page==='backups')loadBackups();if(page==='system')loadPanelSettings()}
-async function refresh(manual=false){if(refreshBusy||credentialsBusy||!session.authenticated)return;refreshBusy=true;try{data=await api('/api/dashboard');status();if(manual){nativeData=null;await render();toast('Данные обновлены')}else if(['overview','peers'].includes(page)&&!$('#main form:focus-within')&&!$('#peer-search:focus')&&!$('#confirm').open)await render()}catch(e){$('#live-state').textContent='Нет ответа';$('#live-state').className='status-badge warn';if(manual)toast(e.message,true)}finally{refreshBusy=false}}
-async function plan(action,params={}){try{pendingPlan=await api('/api/actions/plan',{action,params});$('#confirm-title').textContent='Проверка изменений';$('#confirm-description').textContent=pendingPlan.message;$('#confirm-changes').innerHTML=pendingPlan.changes.length?pendingPlan.changes.map(c=>`<div class="change-row"><strong>${E(labels[c.name]||c.name)}</strong><span class="before">${E(formatValue(c.before))}</span><span class="after">→ ${E(formatValue(c.after))}</span></div>`).join(''):'<div class="note">Изменений не требуется.</div>';$('#confirm-commands').textContent=pendingPlan.commands.map(x=>Array.isArray(x)?x.join(' '):x).join('\n');$('#command-details').hidden=!pendingPlan.commands.length;$('#confirm-apply').textContent=pendingPlan.changes.length?'Применить':'Подтвердить проверку';$('#confirm').showModal()}catch(e){toast(e.message,true)}}
+async function refresh(manual=false,completedJob=null){
+ if(credentialsBusy||!session.authenticated)return;
+ if(refreshBusy){
+  if(!manual&&!completedJob)return;
+  await refreshBusy;
+ }
+ const origin=$('#main').firstElementChild;
+ const request=api('/api/dashboard');
+ const pending=request.catch(()=>{});
+ refreshBusy=pending;
+ try{
+  data=await request;
+  status();
+  if(manual){
+   if(origin!==$('#main').firstElementChild)return;
+   if(lanDraft?.changed()&&!window.confirm('Загрузить сохранённые правила с роутера и сбросить изменения на экране?'))return;
+   nativeData=null;
+   await render();
+   toast('Данные обновлены');
+  }else if(completedJob){
+   const applied=completedJob.savedDraft;
+   if(!lanDraft?.changed()||(applied?.editor===lanDraft&&applied.snapshot===lanDraft.snapshot()))await render();
+  }else if(['overview','peers'].includes(page)&&!preparingPlan&&!$('dialog[open]')&&!$('#main form:focus-within, #peer-search:focus'))await render();
+ }catch(e){
+  $('#live-state').textContent='Нет ответа';
+  $('#live-state').className='status-badge warn';
+  if(manual)toast(e.message,true);
+ }finally{if(refreshBusy===pending)refreshBusy=null;}
+}
+async function plan(action,params={},revision){
+ if(preparingPlan||pendingPlan||$('#confirm').open)return;
+ preparingPlan=true;
+ const origin=$('#main').firstElementChild;
+ const savedDraft=action==='lan_access'?{editor:lanDraft,snapshot:JSON.stringify(params)}:null;
+ try{
+  const body={action,params};
+  if(revision!==undefined)body.lan_revision=revision;
+  const preview=await api('/api/actions/plan',body);
+  if(origin!==$('#main').firstElementChild||!session.authenticated||(savedDraft&&savedDraft.snapshot!==lanDraft?.snapshot())){
+   await api('/api/actions/cancel',{plan_id:preview.id});
+   if(savedDraft?.editor===lanDraft&&lanDraft)toast('Правила были изменены. Проверьте их ещё раз.');
+   return;
+  }
+  $('#confirm-title').textContent='Проверка изменений';
+  $('#confirm-description').textContent=preview.message;
+  $('#confirm-changes').innerHTML=preview.changes.length?preview.changes.map(c=>`<div class="change-row"><strong>${E(labels[c.name]||c.name)}</strong><span class="before">${E(formatValue(c.before))}</span><span class="after">→ ${E(formatValue(c.after))}</span></div>`).join(''):'<div class="note">Изменений не требуется.</div>';
+  $('#confirm-commands').textContent=preview.commands.map(x=>Array.isArray(x)?x.join(' '):x).join('\n');
+  $('#command-details').hidden=!preview.commands.length;
+  $('#confirm-apply').textContent=preview.changes.length?'Применить':'Подтвердить проверку';
+  pendingPlan={id:preview.id,savedDraft};
+  $('#confirm').showModal();
+ }catch(e){toast(e.message,true)}finally{preparingPlan=false;}
+}
 function formatValue(x){return Array.isArray(x)?x.join(', ')||'Нет':typeof x==='boolean'?x?'Включено':'Выключено':x??'Нет'}
-async function showJob(id){activeJob=id;$('#job-dialog').showModal();await pollJob()}
-async function pollJob(){if(!activeJob)return;try{const j=await api('/api/jobs/'+activeJob);$('#job-title').textContent=j.label;$('#job-state').textContent={running:'Выполняется',done:'Готово',error:'Ошибка',interrupted:'Прервано'}[j.state]||j.state;$('#job-state').className='status-badge '+(j.state==='done'?'good':j.state==='error'?'bad':'warn');$('#job-output').textContent=(j.log||[]).map(x=>new Date(x.at*1000).toLocaleTimeString('ru-RU')+'  '+x.text).join('\n')||'Подготовка…';$('#job-result').textContent=j.error||j.result?.message||'';if(j.result?.auth_url&&/^https:\/\//.test(j.result.auth_url)){const a=document.createElement('a');a.href=j.result.auth_url;a.target='_blank';a.rel='noopener noreferrer';a.textContent='Открыть страницу регистрации';$('#job-result').append(document.createElement('br'),a)}if(j.result?.panel_update){activeJob=null;localStorage.setItem('tailscalekeen-update',JSON.stringify({version:j.result.version,at:Date.now()}));watchPanelUpdate();return}if(j.state==='running')setTimeout(pollJob,1200);else{activeJob=null;await refresh(false);await render()}}catch(e){toast(e.message,true);activeJob=null}}
+async function showJob(id,savedDraft=null){
+ const job={id,savedDraft};
+ activeJob=job;
+ $('#job-title').textContent='Выполнение';
+ $('#job-state').textContent='Загрузка…';
+ $('#job-state').className='status-badge';
+ $('#job-output').textContent='';
+ $('#job-result').textContent='';
+ if(!$('#job-dialog').open)$('#job-dialog').showModal();
+ await pollJob(job);
+}
+async function pollJob(job){
+ if(job!==activeJob)return;
+ try{
+  const j=await api('/api/jobs/'+job.id);
+  if(job!==activeJob||!$('#job-dialog').open)return;
+  $('#job-title').textContent=j.label;
+  $('#job-state').textContent={running:'Выполняется',done:'Готово',error:'Ошибка',interrupted:'Прервано'}[j.state]||j.state;
+  $('#job-state').className='status-badge '+(j.state==='done'?'good':j.state==='error'?'bad':'warn');
+  $('#job-output').textContent=(j.log||[]).map(x=>new Date(x.at*1000).toLocaleTimeString('ru-RU')+'  '+x.text).join('\n')||'Подготовка…';
+  $('#job-result').textContent=j.error||j.result?.message||'';
+  if(j.result?.auth_url&&/^https:\/\//.test(j.result.auth_url)){
+   const a=document.createElement('a');
+   a.href=j.result.auth_url;a.target='_blank';a.rel='noopener noreferrer';
+   a.textContent='Открыть страницу регистрации';
+   $('#job-result').append(document.createElement('br'),a);
+  }
+  if(j.result?.panel_update){
+   activeJob=null;
+   localStorage.setItem('tailscalekeen-update',JSON.stringify({version:j.result.version,at:Date.now()}));
+   watchPanelUpdate();
+  }else if(j.state==='running')setTimeout(()=>pollJob(job),1200);
+  else{
+   activeJob=null;
+   await refresh(false,{savedDraft:j.state==='done'?job.savedDraft:null});
+  }
+ }catch(e){if(job===activeJob){toast(e.message,true);activeJob=null;}}
+}
 function fields(form,names){const r={};for(const n of names){const x=form.elements[n];r[n]=x.type==='checkbox'?x.checked:x.value}return r}
 function bindView(){const root=$('#main');$$('[data-copy-address]',root).forEach(b=>b.onclick=()=>copyAddress(b.dataset.copyAddress,b));$$('[data-action]',root).forEach(b=>b.onclick=()=>plan(b.dataset.action));$$('[data-exit]',root).forEach(b=>b.onclick=()=>plan('settings',{exit_node:b.dataset.exit}));$$('[data-diag]',root).forEach(b=>b.onclick=()=>diagnose(b.dataset.diag));$$('[data-ping]',root).forEach(b=>b.onclick=()=>diagnose('ping',b.dataset.ping));$$('[data-job]',root).forEach(b=>b.onclick=()=>showJob(b.dataset.job));$$('[data-device]',root).forEach(b=>b.onclick=()=>openDevice(b.dataset.device));
 const forms={'exit-options':['allow_lan'],'advertise-form':['advertise_exit'],'route-options':['accept_routes','snat','stateful'],'dns-form':['accept_dns','shields_up'],'advanced-form':['hostname','netfilter','ssh','webclient']};for(const [id,names] of Object.entries(forms)){const form=$('#'+id);if(form)form.onsubmit=e=>{e.preventDefault();plan('settings',fields(form,names))}}
@@ -363,16 +482,40 @@ if($('#check-update')){$('#check-update').onclick=checkUpdate;$('#purge-plan').o
 async function diagnose(kind,target=''){try{const j=await api('/api/diagnostics',{kind,target});await showJob(j.id)}catch(e){toast(e.message,true)}}
 async function loadLogs(){try{const d=await api('/api/logs?kind='+encodeURIComponent($('#log-kind')?.value||'panel'));if($('#logs-output'))$('#logs-output').textContent=d.map(x=>x.name+'\n'+x.text).join('\n\n')}catch(e){toast(e.message,true)}}
 async function loadBackups(){try{const list=await api('/api/backups');const root=$('#backup-list');if(!root)return;root.innerHTML=list.length?`<table class="table"><thead><tr><th>Создана</th><th>Копия настроек</th><th>Действия</th></tr></thead><tbody>${list.map(b=>`<tr><td>${E(date(b.created_at))}</td><td>${E(b.settings.hostname||'Настройки клиента')}</td><td><div class="actions"><a href="/api/backups/${E(b.id)}" download>Скачать</a><button class="text-link" data-restore="${E(b.id)}">Восстановить</button><button class="text-link" data-delete="${E(b.id)}">Удалить</button></div></td></tr>`).join('')}</tbody></table>`:'<div class="empty">Сохранённых копий пока нет.</div>';$$('[data-restore]',root).forEach(b=>b.onclick=()=>plan('restore',{backup:b.dataset.restore}));$$('[data-delete]',root).forEach(b=>b.onclick=async()=>{if(!window.confirm('Удалить выбранную копию настроек?'))return;try{await api('/api/backups/delete',{backup:b.dataset.delete});await loadBackups()}catch(e){toast(e.message,true)}})}catch(e){toast(e.message,true)}}
-async function checkUpdate(){const b=$('#check-update');b.disabled=true;$('#update-info').textContent='Проверяю официальный каталог…';try{const x=await api('/api/updates');$('#update-info').textContent=x.available?`Доступно обновление или восстановление клиента до ${x.latest}.`:`Установлен актуальный стабильный клиент ${x.current}.`;if(x.available)await plan('update_client')}catch(e){$('#update-info').textContent=e.message;toast(e.message,true)}finally{b.disabled=false}}
+async function checkUpdate(){
+ const button=$('#check-update'),note=$('#update-info');
+ button.disabled=true;note.textContent='Проверяю официальный каталог…';
+ try{
+  const result=await api('/api/updates');
+  if(!note.isConnected)return;
+  note.textContent=result.available?`Доступно обновление или восстановление клиента до ${result.latest}.`:`Установлен актуальный стабильный клиент ${result.current}.`;
+  if(result.available)await plan('update_client');
+ }catch(e){if(note.isConnected){note.textContent=e.message;toast(e.message,true);}}
+ finally{button.disabled=false;}
+}
 function showLogin(){session.authenticated=false;$('#app').hidden=true;$('#login-screen').hidden=false}
 let booting=null;
 function boot(){if(booting)return booting;booting=loadSession().finally(()=>{booting=null});return booting}
 async function loadSession(){try{session=await api('/api/session');if(session.authenticated){$('#login-screen').hidden=true;$('#app').hidden=false;data=await api('/api/dashboard');status();await render();const trial=new URLSearchParams(location.hash.slice(1)).get('port-confirm');if(trial)await showPortTrial(trial)}else{showLogin();const first=!session.configured,f=$('#login-form');$('#password-confirm-label').hidden=!first;f.elements.password_confirm.required=first;f.elements.password.minLength=first?6:0;f.elements.password.autocomplete=first?'new-password':'current-password';f.elements.username.autocomplete=first?'off':'username';if(first){f.reset();f.elements.username.value='';f.elements.password.value='';f.elements.password_confirm.value=''}$('#login-title').textContent=first?'Создание учётной записи':'Вход в панель Tailscale';$('#login-description').textContent=first?'Задайте отдельные логин и пароль для TailScaleKeen.':'Войдите в панель управления Tailscale.';$('#login-form button[type=submit]').textContent=first?'Создать учётную запись':'Войти';$('#login-hint').textContent=first?'Задайте логин и дважды введите пароль — от 6 знаков, в том числе только цифры.':'Забыли пароль? В SSH выполните: tailscalekeen reset-password'}}catch(e){showLogin();$('#login-error').textContent=e.message}}
 $('#login-form').onsubmit=async e=>{e.preventDefault();const b=$('#login-form button[type=submit]');b.disabled=true;$('#login-error').textContent='';try{const f=e.target;if(!session.configured&&f.elements.password.value!==f.elements.password_confirm.value)throw Error('Пароли не совпадают.');const r=await api(session.configured?'/api/login':'/api/setup',fields(f,session.configured?['username','password']:['username','password','password_confirm']));session={...session,...r,configured:true};f.reset();await boot()}catch(e){$('#login-error').textContent=e.message}finally{b.disabled=false}};
 $('#logout').onclick=async()=>{try{await api('/api/logout',{});$('#appearance').close();await boot()}catch(e){toast(e.message,true)}};
-$('#confirm-apply').onclick=async()=>{const b=$('#confirm-apply');b.disabled=true;try{const j=await api('/api/actions/apply',{plan_id:pendingPlan.id});pendingPlan=null;$('#confirm').close();await showJob(j.id)}catch(e){toast(e.message,true)}finally{b.disabled=false}};
+$('#confirm-apply').onclick=async()=>{
+ const button=$('#confirm-apply'), preview=pendingPlan;
+ if(!preview||button.disabled)return;
+ button.disabled=true;
+ try{
+  const job=await api('/api/actions/apply',{plan_id:preview.id});
+  pendingPlan=null;
+  $('#confirm').close();
+  await showJob(job.id,preview.savedDraft);
+ }catch(e){toast(e.message,true)}finally{button.disabled=false;}
+};
+for(const type of ['cancel','submit'])$('#confirm').addEventListener(type,event=>{
+ if($('#confirm-apply').disabled)event.preventDefault();
+});
 $('#confirm').addEventListener('close',()=>{const old=pendingPlan;pendingPlan=null;if(old)api('/api/actions/cancel',{plan_id:old.id}).catch(error=>toast(error.message,true))});
-$('#job-close').onclick=()=>{$('#job-dialog').close();activeJob=null};
+$('#job-close').onclick=()=>$('#job-dialog').close();
+$('#job-dialog').addEventListener('close',()=>{if(!$('#job-dialog').open)activeJob=null;});
 $('#refresh').onclick=()=>refresh(true);
 function mobileMenu(open){$('.sidebar').classList.toggle('open',open);$('#menu').setAttribute('aria-expanded',String(open));$('#menu-scrim').hidden=!open}
 $('#menu').onclick=()=>mobileMenu(!$('.sidebar').classList.contains('open'));$('#menu-scrim').onclick=()=>mobileMenu(false);
@@ -385,7 +528,19 @@ $('#native-web-link').href=location.protocol+'//'+location.hostname+'/';
 function collapseMenu(collapsed){document.documentElement.classList.toggle('menu-collapsed',collapsed);$('#collapse-menu').setAttribute('aria-expanded',String(!collapsed));$('#collapse-menu').setAttribute('aria-label',collapsed?'Показывать меню':'Скрывать меню');localStorage.setItem('ts-panel-menu-collapsed',String(collapsed))}
 collapseMenu(localStorage.getItem('ts-panel-menu-collapsed')==='true');$('#collapse-menu').onclick=()=>collapseMenu(!document.documentElement.classList.contains('menu-collapsed'));
 $$('.nav-group-title').forEach(title=>{title.title=title.textContent.trim();title.tabIndex=0;title.setAttribute('role','button');const open=()=>{if(document.documentElement.classList.contains('menu-collapsed'))collapseMenu(false)};title.onclick=open;title.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();open()}}});
-window.addEventListener('hashchange',()=>{mobileMenu(false);render()});setInterval(()=>{if(!document.hidden)refresh(false)},5000);boot();
+window.addEventListener('hashchange',()=>{
+ mobileMenu(false);
+ if(lanDraft?.changed()&&location.hash!=='#lan-access'&&!window.confirm('Покинуть раздел и сбросить несохранённые правила доступа?')){
+  history.replaceState(history.state,'','#lan-access');
+  return;
+ }
+ render();
+});
+window.addEventListener('beforeunload',event=>{
+ if(lanDraft?.changed()){event.preventDefault();event.returnValue=true;}
+});
+setInterval(()=>{if(!document.hidden)refresh(false)},5000);
+boot();
 
 function icon(name){const paths={copy:'<rect x="8" y="6" width="12" height="16" rx="1"/><path d="M16 3H4v15"/>',wifi:'<path d="M2 8a16 16 0 0 1 20 0M5 12a11 11 0 0 1 14 0M8 16a6 6 0 0 1 8 0"/><circle cx="12" cy="20" r="1" fill="currentColor" stroke="none"/>',monitor:'<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>',globe:'<circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18M5 6.5h14M5 17.5h14"/>',devices:'<rect x="2" y="4" width="14" height="10" rx="1"/><path d="M7 14v5M4 19h10"/><rect x="18" y="8" width="4" height="12" rx="1"/>',shield:'<path d="M12 2 21 6v6c0 5-5 8-9 10-4-2-9-5-9-10V6Z"/>',settings:'<path d="m9 3-.7 2.3-2 .9-2.2-.5-2 3.5 1.6 1.8v2.2L2.1 15l2 3.5 2.2-.5 2 .9L9 21h4l.7-2.1 2-.9 2.2.5 2-3.5-1.6-1.8V11l1.6-1.8-2-3.5-2.2.5-2-.9L13 3Z"/><circle cx="11" cy="12" r="3"/>',external:'<path d="M14 3h7v7M21 3l-11 11M10 4H4v16h16v-6"/>',edit:'<path d="m15 4 5 5-11 11H4v-5ZM13 6l5 5"/>',pulse:'<path d="M2 15h5l3-10 4 15 3-9 2 4h3"/>',refresh:'<path d="M20 10a8 8 0 1 0 0 6M20 3v7h-7"/>',theme:'<circle cx="12" cy="12" r="9"/><path d="M12 3v18"/>',menu:'<path d="M3 6h18M3 12h18M3 18h18"/>',close:'<path d="m6 6 12 12M18 6 6 18"/>',arrow:'<path d="m12 5-7 7 7 7M5 12h15"/>',eye:'<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',route:'<circle cx="5" cy="5" r="2"/><circle cx="19" cy="19" r="2"/><path d="M5 7v9a3 3 0 0 0 3 3h9M19 17V8a3 3 0 0 0-3-3H7"/>'};return `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]||paths.globe}</svg>`}
 async function loadEgress(){try{const value=await api('/api/egress');const root=$('#egress-section');if(!root)return;root.innerHTML=`<h3>Через что раздавать интернет</h3><p class="muted small">Выход для устройств, которые выбрали этот роутер как Exit node.</p><form id="egress-form"><label>Подключение или политика<select name="target" aria-label="Выход для клиентов Exit node">${value.choices.map(x=>`<option value="${E(x.id)}" ${x.id===value.current.target?'selected':''} ${!x.available?'disabled':''}>${E(x.label)}${x.available?'':' — нет подключения'}</option>`).join('')}</select></label><p class="egress-status">Сейчас: ${E(value.current.label)}.</p><div class="form-actions"><button type="submit" class="primary">Проверить и применить</button></div></form><div class="note">LAN и связь между устройствами Tailscale сохраняются. VPN выбирается через его политику Keenetic. При отказе выбранного выхода другой провайдер не используется. IPv6 без рабочего выхода блокируется.</div>`;decorateFields(root);$('#egress-form').onsubmit=e=>{e.preventDefault();plan('egress',{target:e.target.elements.target.value})}}catch(e){if($('#egress-section'))$('#egress-section').textContent=e.message}}
@@ -409,7 +564,15 @@ function bindPanelAccess(){
  const form=$('#account-form');if(form)form.onsubmit=async e=>{e.preventDefault();const b=form.querySelector('[type=submit]');$('#account-error').textContent='';try{if(form.elements.password.value!==form.elements.password_confirm.value)throw Error('Пароли не совпадают.');b.disabled=true;credentialsBusy=true;while(refreshBusy)await new Promise(resolve=>setTimeout(resolve,25));const result=await api('/api/password',fields(form,['username','current_password','password','password_confirm']));form.reset();session={...session,...result};await boot();toast('Учётная запись сохранена. Другие сеансы завершены.')}catch(e){if($('#account-error'))$('#account-error').textContent=e.message}finally{credentialsBusy=false;b.disabled=false}};
  const port=$('#panel-port-form');if(port)port.onsubmit=async e=>{e.preventDefault();if(credentialsBusy){toast('Дождитесь сохранения учётной записи.');return}$('#panel-port-error').textContent='';const b=port.querySelector('button');b.disabled=true;try{const value=await api('/api/panel-port/begin',{port:Number(port.elements.port.value)});if(value.unchanged){toast('Этот порт уже используется');return}await showPortTrial(value.id)}catch(e){$('#panel-port-error').textContent=e.message}finally{b.disabled=false}}
 }
-async function loadPanelSettings(){try{const settings=await api('/api/panel-settings');if($('#panel-port-status'))$('#panel-port-status').textContent=settings.pending?'Проверяется порт '+settings.pending.new_port+'. Прежний порт '+settings.pending.old_port+' пока доступен.':'Текущий порт: '+settings.port+'.';if($('#account-form'))$('#account-form').elements.username.value=settings.username}catch(e){toast(e.message,true)}}
+async function loadPanelSettings(){
+ const note=$('#panel-port-status'), username=$('#account-form').elements.username;
+ try{
+  const settings=await api('/api/panel-settings');
+  if(!note.isConnected)return;
+  note.textContent=settings.pending?'Проверяется порт '+settings.pending.new_port+'. Прежний порт '+settings.pending.old_port+' пока доступен.':'Текущий порт: '+settings.port+'.';
+  if(username.value===username.defaultValue)username.value=username.defaultValue=settings.username;
+ }catch(e){if(note.isConnected)toast(e.message,true);}
+}
 let portTrial=null;
 function portURL(port,hash){const u=new URL(location.href);u.port=String(port);u.pathname='/';u.search='';u.hash=hash;return u.href}
 async function showPortTrial(id){const settings=await api('/api/panel-settings'),p=settings.pending;if(!p||p.id!==id){toast('Проверка порта уже завершена. Используйте прежний адрес, если изменение не было подтверждено.',true);return}portTrial=p;const atNew=Number(location.port||(location.protocol==='https:'?443:80))===p.new_port;$('#port-message').textContent=atNew?'Новый адрес открылся. Подтвердите смену порта до '+new Date(p.expires_at*1000).toLocaleTimeString('ru-RU')+'.':'Откройте новый адрес и подтвердите смену. До '+new Date(p.expires_at*1000).toLocaleTimeString('ru-RU')+' прежний адрес остаётся доступным.';$('#port-old-link').href=portURL(p.old_port,'system');$('#port-old-link').textContent=$('#port-old-link').href;$('#port-new-link').href=portURL(p.new_port,'port-confirm='+p.id);$('#port-new-link').hidden=atNew;$('#port-confirm').hidden=!atNew;$('#port-error').textContent='';if(!$('#port-dialog').open)$('#port-dialog').showModal()}
@@ -418,9 +581,15 @@ $('#port-cancel').onclick=async()=>{try{const result=await api('/api/panel-port/
 $('#port-dialog-close').onclick=()=>$('#port-dialog').close();
 
 async function checkPanelUpdate(){
- const button=$('#check-panel-update');button.disabled=true;$('#panel-update-info').textContent='Проверяю стабильные релизы GitHub…';
- try{const info=await api('/api/panel-updates?fresh=1');$('#panel-update-info').textContent=info.available?`Установлена ${info.current}. Доступна ${info.latest}.`:`Установлена актуальная панель ${info.current}.`;if(info.available)await plan('update_panel')}
- catch(error){$('#panel-update-info').textContent=error.message;toast(error.message,true)}finally{button.disabled=false}
+ const button=$('#check-panel-update'),note=$('#panel-update-info');
+ button.disabled=true;note.textContent='Проверяю стабильные релизы GitHub…';
+ try{
+  const info=await api('/api/panel-updates?fresh=1');
+  if(!note.isConnected)return;
+  note.textContent=info.available?`Установлена ${info.current}. Доступна ${info.latest}.`:`Установлена актуальная панель ${info.current}.`;
+  if(info.available)await plan('update_panel');
+ }catch(error){if(note.isConnected){note.textContent=error.message;toast(error.message,true);}}
+ finally{button.disabled=false;}
 }
 async function loadPanelUpdateStatus(){
  try{const result=await api('/api/panel-update-status');if(result.state&&$('#panel-update-info'))$('#panel-update-info').textContent=result.message;if(['prepared','installing','checking'].includes(result.state)){localStorage.setItem('tailscalekeen-update',JSON.stringify({version:result.version,at:Date.now()}));watchPanelUpdate()}}catch(error){toast(error.message,true)}
@@ -432,12 +601,20 @@ async function watchPanelUpdate(){
  if(!pending||Date.now()-pending.at>600000){localStorage.removeItem('tailscalekeen-update');panelUpdateWatching=false;return}
  const until=Date.now()+120000;
  while(Date.now()<until){
-  if($('#job-state'))$('#job-state').textContent='Обновляется панель';
-  if($('#job-result'))$('#job-result').textContent='Дождитесь завершения. Соединение с панелью временно прервётся.';
+  if(!activeJob&&$('#job-dialog').open){
+   $('#job-state').textContent='Обновляется панель';
+   $('#job-result').textContent='Дождитесь завершения. Соединение с панелью временно прервётся.';
+  }
   try{
    const response=await fetch('/api/session',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(4000)}),value=await response.json(),result=value.panel_update;
-   if(result&&['done','rolled_back','error'].includes(result.state)){
-    localStorage.removeItem('tailscalekeen-update');panelUpdateWatching=false;$('#job-dialog').close();await boot();toast(result.message,result.state!=='done');return
+   if(result?.version===pending.version&&['done','rolled_back','error'].includes(result.state)){
+    localStorage.removeItem('tailscalekeen-update');panelUpdateWatching=false;
+    if(!activeJob)$('#job-dialog').close();
+    if(result.state==='done'){
+     if(lanDraft?.changed())toast('Панель обновлена. После сохранения правил перезагрузите страницу.');
+     else location.reload();
+    }else toast(result.message,true);
+    return;
    }
   }catch{}
   await new Promise(resolve=>setTimeout(resolve,1800));

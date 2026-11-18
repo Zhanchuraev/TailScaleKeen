@@ -6,7 +6,9 @@ force chains. Unmatched marked packets fail closed instead of using another WAN.
 """
 
 import hashlib, ipaddress, json, pathlib, re, shlex, urllib.request, time
+from itertools import chain
 from .core import Error, read_json, write_json
+from .lan_access import TABLES as LAN_TABLES
 from .routing import route_rows, rule_rows
 
 MARK = "0x5a000000/0xff000000"
@@ -349,6 +351,30 @@ class Egress:
             )
         return families
 
+    def anchors(self, tool, table, base, installing=False):
+        """Keep LAN permission checks ahead of exit routing and generic forwarding."""
+        output = self.call([tool, "-t", table, "-S", base], False).stdout
+        rows = (shlex.split(line) for line in output.splitlines() if line.startswith("-A "))
+        lan_base, lan_chain, *_ = LAN_TABLES[table]
+        offset = 0
+        for row in rows:
+            if tool == "iptables" and base == lan_base and row == ["-A", base, "-j", lan_chain]:
+                offset += 1
+            elif (installing and base == "FORWARD" and TAG + "-hold" in row and
+                  "-j" in row and row[row.index("-j") + 1] == "TSP_EXIT_HOLD"):
+                offset += 1
+            else:
+                return offset, chain((row,), rows)
+        return offset, rows
+
+    def anchors_ready(self, tool, table, base, targets):
+        _, rows = self.anchors(tool, table, base)
+        for target in targets:
+            row = next(rows, [])
+            if TAG not in row or "-j" not in row or row[row.index("-j") + 1] != target:
+                return False
+        return True
+
     def install_rules(self, choice, specs):
         for f in specs:
             fam, tool, src = f["family"], f["tool"], f["source"]
@@ -357,6 +383,7 @@ class Egress:
                 self.call([tool, "-t", table, "-A", chain, *args])
 
             def anchor(table, base, *args):
+                offset, _ = self.anchors(tool, table, base, installing=True)
                 self.call(
                     [
                         tool,
@@ -364,7 +391,7 @@ class Egress:
                         table,
                         "-I",
                         base,
-                        "1",
+                        str(offset + 1),
                         *args,
                         "-m",
                         "comment",
@@ -520,9 +547,7 @@ class Egress:
         alive = True
         for spec in specs:
             tool = spec["tool"]
-            top = self.call([tool, "-t", "mangle", "-S", "PREROUTING"], False).stdout
-            first = next((l for l in top.splitlines() if l.startswith("-A ")), "")
-            alive = alive and CHAINS["mangle"] in first
+            alive = alive and self.anchors_ready(tool, "mangle", "PREROUTING", [CHAINS["mangle"]])
             rules = rule_rows(
                 self.call(
                     ["ip", "-" + str(spec["family"]), "rule", "show"], False
@@ -552,12 +577,12 @@ class Egress:
                 alive
                 and sum(l.startswith("-A ") for l in body.splitlines()) == expected
             )
-            forward = self.call([tool, "-t", "filter", "-S", "FORWARD"], False).stdout
-            alive = alive and TAG in forward and CHAINS["filter"] in forward
+            alive = alive and self.anchors_ready(tool, "filter", "FORWARD", ["ACCEPT", CHAINS["filter"]])
             if spec["nat"]:
-                base = "PREROUTING" if spec["proxy"] else "POSTROUTING"
-                nat = self.call([tool, "-t", "nat", "-S", base], False).stdout
-                alive = alive and TAG in nat and CHAINS["nat"] in nat
+                pre_target = CHAINS["nat"] if spec["proxy"] else "ACCEPT"
+                alive = alive and self.anchors_ready(tool, "nat", "PREROUTING", [pre_target])
+                if not spec["proxy"]:
+                    alive = alive and self.anchors_ready(tool, "nat", "POSTROUTING", [CHAINS["nat"]])
         if force or old.get("fingerprint") != fingerprint or not alive:
             self.hold(True)
             for attempt in range(2):

@@ -78,7 +78,7 @@ class Service:
             self.jobs.lock.release()
 
     def maintain_lan_access(self):
-        if self.lan_access.current()["mode"] == "off" or not self.jobs.lock.acquire(False):
+        if not self.lan_access.needs_recovery() or not self.jobs.lock.acquire(False):
             return
         try:
             with operation_lock(self.state):
@@ -142,11 +142,13 @@ class Service:
                 "exit_advertised": False,
                 "auth_url": "",
             }
+        lan_policy = self.lan_access.current()
         return {
             "panel_version": VERSION,
             "tailscale": s,
             "devices": self.devices.list(s),
-            "lan_access": self.lan_access.current(),
+            "lan_access": lan_policy,
+            "lan_access_revision": self.policy_revision(lan_policy),
             "jobs": self.jobs.list()[:8],
             "metrics": self.metrics(s),
             "system": {
@@ -189,7 +191,17 @@ class Service:
             }
         return result
 
-    def plan(self, action, params):
+    @staticmethod
+    def policy_revision(policy):
+        return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+
+    def check_lan_settings(self, fields):
+        if self.lan_access.current()["mode"] != "off" and (
+            fields.get("accept_routes") is False or fields.get("exit_node")
+        ):
+            raise Error("Сначала отключите политику доступа из LAN", 409)
+
+    def plan(self, action, params, lan_revision=None):
         if not isinstance(params, dict):
             raise Error("Параметры должны быть объектом")
         if self.panel_updater.active():
@@ -210,13 +222,15 @@ class Service:
         message = ""
         native_revision = None
         egress_revision = None
-        lan_revision = None
+        saved_policy = None
         s = self.ts.snapshot(True)
         revision = hashlib.sha256(json.dumps(s["prefs"], sort_keys=True).encode()).hexdigest()
         if action == "lan_access":
             existing = self.lan_access.current()
+            if lan_revision is not None and lan_revision != self.policy_revision(existing):
+                raise Error("Правила доступа изменились после открытия страницы. Обновите список и проверьте свой выбор.", 409)
             wanted = self.lan_access.plan(params, s)
-            lan_revision = existing
+            saved_policy = existing
             modes = {"off": "Выключено", "selected": "По устройствам", "all": "Все устройства выбранных сегментов"}
             changes = [
                 {"name": "Доступ из LAN", "before": modes[existing["mode"]], "after": modes[wanted["mode"]]},
@@ -236,11 +250,8 @@ class Service:
             changes = [change for change in changes if change["before"] != change["after"]]
             message = "Проверьте выбранные сегменты и разрешённые подсети."
         elif action == "settings":
-            if self.lan_access.current()["mode"] != "off" and (
-                params.get("accept_routes") is False or params.get("exit_node")
-            ):
-                raise Error("Сначала отключите политику доступа из LAN")
-            args, changes = self.ts.set_args(params)
+            self.check_lan_settings(params)
+            args, changes = self.ts.set_args(params, s)
             commands = [["tailscale", "set", *args]] if args else []
             message = (
                 "Изменятся только выбранные параметры. Остальные настройки сохранятся."
@@ -329,7 +340,8 @@ class Service:
             if set(params) != {"backup"}:
                 raise Error("Выберите резервную копию")
             backup = self.get_backup(params["backup"])
-            _, changes = self.ts.set_args(backup["settings"])
+            self.check_lan_settings(backup["settings"])
+            _, changes = self.ts.set_args(backup["settings"], s)
             message = "Будут восстановлены только настройки клиента, без замены ключей устройства."
         else:
             raise Error("Неизвестное действие")
@@ -340,7 +352,7 @@ class Service:
             "revision": revision,
             "native_revision": native_revision,
             "egress_revision": egress_revision,
-            "lan_revision": lan_revision,
+            "lan_revision": saved_policy,
             "expires": time.time() + 180,
         })
         return {
@@ -396,7 +408,7 @@ class Service:
                 if hashlib.sha256(normalize(self.native.cli("show running-config")).encode()).hexdigest() != plan["native_revision"]:
                     raise Error("Настройки роутера изменились перед выполнением. Сформируйте новый план.", 409)
             self.event("action_started", {"action": action})
-            policies = [] if action == "update_panel" else self.native.linked_policies()
+            policies = self.native.linked_policies() if action in {"settings", "restore", "restart"} else []
             if action == "update_panel":
                 result = self.panel_updater.prepare(log, params["version"])
             elif action == "lan_access":
@@ -404,6 +416,7 @@ class Service:
                     raise Error("Список доступа изменился. Обновите предпросмотр.", 409)
                 result = self.lan_access.change(params, log)
             elif action == "settings":
+                self.check_lan_settings(params)
                 result = self.ts.apply_settings(params, log)
                 self.native.sync_policies(
                     policies, bool(result["snapshot"]["prefs"].get("ExitNodeID"))
@@ -438,9 +451,9 @@ class Service:
             elif action == "update_client":
                 result = self.updater.update(log)
             elif action == "restore":
-                result = self.ts.apply_settings(
-                    self.get_backup(params["backup"])["settings"], log
-                )
+                settings = self.get_backup(params["backup"])["settings"]
+                self.check_lan_settings(settings)
+                result = self.ts.apply_settings(settings, log)
                 self.native.sync_policies(
                     policies, bool(result["snapshot"]["prefs"].get("ExitNodeID"))
                 )
@@ -571,10 +584,11 @@ class Service:
                 q.stderr = q.stderr.replace(params["auth_key"], "[hidden]")
             self.ts.invalidate()
             s = self.ts.snapshot(True)
-            if s["backend_state"] == "Running":
+            active_server = (s["prefs"].get("ControlURL") or "").rstrip("/")
+            if q.returncode == 0 and s["backend_state"] == "Running" and active_server == server:
                 return {"message": "Устройство подключено"}
             url = s.get("auth_url") or next(
-                iter(re.findall(r"https://[^\s]+", q.stdout + q.stderr)), ""
+                iter(re.findall(r"(?m)^[ \t]*(https://[^\s]+)[ \t]*$", q.stdout + "\n" + q.stderr)), ""
             )
             if url:
                 return {
@@ -582,7 +596,7 @@ class Service:
                     "auth_url": url,
                     "needs_login": True,
                 }
-            raise Error(scrub(q.stderr or "Подтвердите регистрацию в консоли сервера"))
+            raise Error(scrub(q.stderr or "Клиент пока не подтвердил подключение к выбранному серверу"), 502)
         finally:
             params.pop("auth_key", None)
             if tmp:

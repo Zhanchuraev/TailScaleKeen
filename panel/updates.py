@@ -1,7 +1,16 @@
-import hashlib, io, json, os, pathlib, platform, re, shutil, tarfile, tempfile, time
+import hashlib, json, os, pathlib, platform, re, shutil, time
 from .core import Error, download, read_json, write_json
+from .install import extract_client
 
 BASE = "https://pkgs.tailscale.com/stable/"
+
+
+def binary_digest(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(256 * 1024), b""):
+            digest.update(chunk)
+    return digest.digest()
 
 
 class Updater:
@@ -96,18 +105,8 @@ class Updater:
         root.mkdir(exist_ok=True)
         candidate = root / "candidate"
         candidate.mkdir(exist_ok=True)
-        with tarfile.open(fileobj=io.BytesIO(blob)) as t:
-            for name in ["tailscale", "tailscaled"]:
-                members = [
-                    m
-                    for m in t
-                    if pathlib.PurePosixPath(m.name).name == name and m.isfile()
-                ]
-                if len(members) != 1:
-                    raise Error("Неверный состав архива Tailscale")
-                p = candidate / name
-                p.write_bytes(t.extractfile(members[0]).read())
-                p.chmod(0o755)
+        extract_client(blob, candidate)
+        del blob
         if (
             self.runner.run(
                 [str(candidate / "tailscale"), "version"]
@@ -150,12 +149,8 @@ class Updater:
             pid = self.runner.run(["pidof", "tailscaled"]).stdout.strip()
             if (
                 not pid.isdecimal()
-                or hashlib.sha256(
-                    pathlib.Path("/proc/" + pid + "/exe").read_bytes()
-                ).hexdigest()
-                != hashlib.sha256(
-                    pathlib.Path("/opt/bin/tailscaled").read_bytes()
-                ).hexdigest()
+                or binary_digest(pathlib.Path("/proc/" + pid + "/exe"))
+                != binary_digest(pathlib.Path("/opt/bin/tailscaled"))
             ):
                 raise Error("Работающий daemon не совпадает с новым бинарником")
             if fingerprint() != identity:

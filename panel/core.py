@@ -3,7 +3,7 @@
 from __future__ import annotations
 import contextlib, hashlib, ipaddress, json, os, pathlib, re, secrets, shlex, subprocess, threading, time, urllib.parse, urllib.request
 
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 PREF_KEYS = (
     "ControlURL",
     "RouteAll",
@@ -178,8 +178,8 @@ class Tailscale:
             json.dumps(self.snapshot(True)["prefs"], sort_keys=True).encode()
         ).hexdigest()
 
-    def set_args(self, fields):
-        s = self.snapshot(True)
+    def set_args(self, fields, snapshot=None):
+        s = self.snapshot(True) if snapshot is None else snapshot
         p = s["prefs"]
         args = []
         changes = []

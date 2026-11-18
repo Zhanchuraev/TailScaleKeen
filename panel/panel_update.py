@@ -95,15 +95,15 @@ class PanelUpdater:
         return {"panel_update": True, "transaction": record["id"], "version": info["latest"], "message": record["message"]}
 
 
-def health(port, version, configured, timeout=25):
+def health(host, port, version, configured, timeout=25):
     until = time.monotonic() + timeout
     while time.monotonic() < until:
-        c = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        c = http.client.HTTPConnection(host, port, timeout=2)
         try:
             c.request("GET", "/api/session")
             r = c.getresponse()
             data = json.loads(r.read(65536))
-            if r.status == 200 and data.get("version") == version and data.get("configured") == configured:
+            if r.status == 200 and isinstance(data, dict) and data.get("version") == version and data.get("configured") is configured:
                 return True
         except (OSError, ValueError, http.client.HTTPException):
             pass
@@ -143,17 +143,20 @@ def apply_staged(state, token, root="/", control=None, probe=None):
     configured = bool(read_json(state / "auth.json").get("password_hash"))
     config = read_json(state / "config.json")
     port = int(config.get("port", 8092))
+    host = config.get("bind") or "0.0.0.0"
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
     extras = [init, prefix / "opt/bin/tailscale-panel", prefix / "opt/bin/tailscalekeen"]
     extra_before = {p: (p.read_bytes(), p.stat().st_mode & 0o777) if p.exists() else None for p in extras}
     stopped = swapped = moved_previous = False
     try:
         record.update(state="installing", message="Установка проверенного кода панели")
         write_json(task.journal, record)
-        control("stop")
-        stopped = True
         if stage.exists():
             shutil.rmtree(stage)
         shutil.copytree(candidate, stage)
+        control("stop")
+        stopped = True
         if previous.exists():
             shutil.rmtree(previous)
         if target.exists():
@@ -171,7 +174,7 @@ def apply_staged(state, token, root="/", control=None, probe=None):
         record.update(state="checking", message="Проверка новой панели")
         write_json(task.journal, record)
         control("start")
-        if not probe(port, record["version"], configured):
+        if not probe(host, port, record["version"], configured):
             raise Error("Новая панель не прошла проверку запуска")
         for name in ["auth.json", "account-state.json"]:
             p = state / name
@@ -202,7 +205,7 @@ def apply_staged(state, token, root="/", control=None, probe=None):
         if stopped:
             with contextlib.suppress(Exception):
                 control("start")
-                restored = probe(port, record["from_version"], configured)
+                restored = probe(host, port, record["from_version"], configured)
         record.update(state="rolled_back" if restored else "error", finished_at=int(time.time()),
                       message="Обновление отменено; прежняя панель восстановлена" if restored else "Обновление не завершено; проверьте службу через SSH",
                       error=type(exc).__name__)
@@ -227,19 +230,19 @@ def main():
     token = read_json(state / "panel-update/transaction.json").get("token")
     if not isinstance(token, str) or len(token) != 32:
         raise Error("Нет подготовленного обновления")
-    # Let the scheduling HTTP job finish before stopping the server.
-    until = time.monotonic() + 60
-    while True:
-        try:
-            with operation_lock(state):
-                pass
-            break
-        except Error:
-            if time.monotonic() >= until:
-                raise
-            time.sleep(0.25)
     try:
-        apply_staged(state, token)
+        # Wait for the scheduling HTTP job, then keep its cross-process lock through rollback.
+        with contextlib.ExitStack() as locks:
+            until = time.monotonic() + 60
+            while True:
+                try:
+                    locks.enter_context(operation_lock(state))
+                    break
+                except Error:
+                    if time.monotonic() >= until:
+                        raise
+                    time.sleep(0.25)
+            apply_staged(state, token)
     except Exception as exc:
         task = PanelUpdater(state)
         record = read_json(task.journal)

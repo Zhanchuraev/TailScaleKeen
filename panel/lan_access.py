@@ -1,11 +1,14 @@
 """Limit forwarded IPv4 access to explicitly selected tailnet subnets."""
 import ipaddress
+import os
 import re
 import shlex
+import tempfile
 import time
 from pathlib import Path
 
 from .core import Error, read_json, write_json
+from .routing import route_rows
 
 HOOK = Path("/opt/etc/ndm/netfilter.d/94-tailscalekeen-lan.sh")
 HOOK_TEXT = "#!/bin/sh\n/opt/bin/tailscalekeen lan-access-sync >/dev/null 2>&1\n"
@@ -22,10 +25,14 @@ TABLES = {
 class LanAccess:
     def __init__(self, state, runner, tailscale, tun):
         self.path = Path(state) / "lan-access.json"
+        self.pending = Path(state) / "lan-access-pending.json"
         self.runner, self.ts, self.tun = runner, tailscale, tun
 
     def current(self):
         return read_json(self.path, {"mode": "off", "bridge": "br0", "devices": [], "subnets": []})
+
+    def needs_recovery(self):
+        return self.pending.exists() or self.current()["mode"] != "off"
 
     @staticmethod
     def bridges(config):
@@ -219,7 +226,21 @@ class LanAccess:
 
     def live_rules(self, priority=PRIORITY):
         dump = self.runner.run(["ip", "-4", "rule", "show"]).stdout
-        return {tuple(line.split()[1:]) for line in dump.splitlines() if line.startswith(priority + ":")}
+        result = set()
+        for line in dump.splitlines():
+            fields = line.split()
+            if not fields or fields[0] != priority + ":":
+                continue
+            # iproute2 omits /32 on host destinations in `ip rule show`.
+            if "to" in fields:
+                index = fields.index("to") + 1
+                if index < len(fields):
+                    try:
+                        fields[index] = str(ipaddress.IPv4Network(fields[index]))
+                    except ValueError:
+                        pass
+            result.add(tuple(fields[1:]))
+        return result
 
     def rule_changes(self, config, previous):
         pairs = ((MGMT_PRIORITY, self.management_rules), (PRIORITY, self.route_rules))
@@ -303,6 +324,8 @@ class LanAccess:
             self.runner.run(args, timeout=45, input_text=payload)
 
     def sync(self, config=None, previous=None):
+        if config is None:
+            self.finish_pending()
         config = self.current() if config is None else config
         previous = config if previous is None else previous
         if config["mode"] == previous["mode"] == "off":
@@ -317,7 +340,54 @@ class LanAccess:
             for rule in sorted(desired - actual):
                 self.runner.run(["ip", "-4", "rule", "add", "pref", priority, *rule])
 
+    def set_accept(self, enabled):
+        self.ts.run("set", "--accept-routes=" + str(enabled).lower())
+        self.ts.invalidate()
+
+    @staticmethod
+    def ensure_hook():
+        if HOOK.exists():
+            if HOOK.read_text() != HOOK_TEXT:
+                raise Error("Путь сетевого обработчика уже занят")
+            return
+        # A power loss during creation must not leave a partial executable.
+        stream = tempfile.NamedTemporaryFile(dir=HOOK.parent, prefix=".tailscalekeen-", delete=False)
+        staged = Path(stream.name)
+        try:
+            with stream:
+                stream.write(HOOK_TEXT.encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            staged.chmod(0o755)
+            os.replace(staged, HOOK)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    def finish_pending(self):
+        if not self.pending.exists():
+            return
+        txn = read_json(self.pending)
+        if not isinstance(txn, dict) or not {"prior", "wanted", "accepted", "new_accept", "had_hook"} <= txn.keys():
+            raise Error("Повреждён журнал изменения правил LAN")
+        prior, wanted = txn["prior"], txn["wanted"]
+        current = self.current()
+        if current == prior:
+            # A failed or interrupted apply has not committed. Either policy's
+            # rules may be live. Reconcile only their union under the operation lock.
+            reset_accept = txn["accepted"] != txn["new_accept"]
+            if reset_accept and not txn["accepted"]:
+                self.set_accept(False)
+            self.sync(prior, wanted if wanted["mode"] != "off" else prior)
+            if reset_accept and txn["accepted"]:
+                self.set_accept(True)
+            if not txn["had_hook"] and HOOK.exists() and HOOK.read_text() == HOOK_TEXT:
+                HOOK.unlink()
+        elif current != wanted:
+            raise Error("Сохранённая политика LAN отличается от незавершённой операции")
+        self.pending.unlink()
+
     def change(self, fields, log):
+        self.finish_pending()
         prior = self.current()
         snapshot = self.ts.snapshot(True)
         wanted = self.plan(fields, snapshot)
@@ -326,51 +396,67 @@ class LanAccess:
         accepted = bool(snapshot["prefs"].get("RouteAll"))
         if wanted["mode"] != "off":
             wanted["restore_accept_routes"] = prior.get("restore_accept_routes", accepted)
-        # Validate the full kernel transaction before writing the desired state.
+        # Leave the last committed policy in place until every step succeeds.
         if wanted["mode"] != "off" or prior["mode"] != "off":
             list(self.rule_changes(wanted, prior))
             self.restore(self.payload(wanted, prior), test=True)
-        write_json(self.path, wanted)
+        new_accept = wanted["mode"] != "off" or prior.get("restore_accept_routes", accepted)
+        write_json(self.pending, {"prior": prior, "wanted": wanted, "accepted": accepted,
+                                  "new_accept": new_accept, "had_hook": HOOK.exists()})
         try:
+            if accepted and not new_accept:
+                self.set_accept(False)
             self.sync(wanted, prior)
-            new_accept = wanted["mode"] != "off" or prior.get("restore_accept_routes", accepted)
-            if new_accept != accepted:
-                self.ts.run("set", "--accept-routes=" + str(new_accept).lower())
-                self.ts.invalidate()
+            if new_accept and not accepted:
+                self.set_accept(True)
             if wanted["mode"] != "off":
                 self.verify_routes(wanted["subnets"])
-                if not HOOK.exists():
-                    HOOK.write_text(HOOK_TEXT)
-                    HOOK.chmod(0o755)
+                self.ensure_hook()
+            write_json(self.path, wanted)
         except Exception:
-            write_json(self.path, prior)
-            self.sync(prior, wanted)
-            self.ts.run("set", "--accept-routes=" + str(accepted).lower())
-            self.ts.invalidate()
+            self.finish_pending()
             raise
+        self.pending.unlink()
         log("Политика доступа локальных устройств применена")
         return {"message": "Правила доступа сохранены", "lan_access": wanted}
 
     def verify_routes(self, desired):
+        # iproute2 prints a bare destination for an IPv4 host route.
+        kernel_names = {net: net.removesuffix("/32") for net in desired}
         for _ in range(12):
             output = self.runner.run(["ip", "-4", "route", "show", "table", "52"], check=False).stdout
-            active = {line.split()[0] for line in output.splitlines() if f" dev {self.tun} " in line + " "}
-            missing = set(desired) - active
+            active = {row["dst"].removesuffix("/32") for row in route_rows(output)
+                      if row["type"] == "unicast" and row.get("dev") == self.tun}
+            missing = {net for net, name in kernel_names.items() if name not in active}
             if not missing:
                 return
             time.sleep(1)
         raise Error("Tailscale не выдал маршруты: " + ", ".join(sorted(missing)))
 
     def remove(self):
+        # The uninstaller stops and removes the client separately, so it only needs
+        # to clean up kernel rules from both sides of an interrupted transition.
         prior = self.current()
+        if self.pending.exists():
+            txn = read_json(self.pending)
+            if not isinstance(txn, dict) or not {"prior", "wanted"} <= txn.keys() or prior not in (txn["prior"], txn["wanted"]):
+                raise Error("Состояние LAN отличается от журнала изменения правил")
+            changes = list(self.rule_changes(txn["wanted"], txn["prior"]))
+            prior = next((config for config in (txn["prior"], txn["wanted"]) if config["mode"] != "off"), prior)
+            self.restore(self.payload({"mode": "off"}, prior), test=True)
+            for priority, live, _ in changes:
+                for rule in sorted(live):
+                    self.runner.run(["ip", "-4", "rule", "del", "pref", priority, *rule])
         self.sync({"mode": "off"}, prior)
         if HOOK.exists() and HOOK.read_text() == HOOK_TEXT:
             HOOK.unlink()
 
     def recover(self):
+        self.finish_pending()
         config = self.current()
         if config["mode"] == "off":
             return
+        self.ensure_hook()
         if all(live == desired for _, live, desired in self.rule_changes(config, config)):
             for table, (parent, first, *_) in TABLES.items():
                 rows = self.runner.run(["iptables", "-w", "-t", table, "-S", parent]).stdout.splitlines()

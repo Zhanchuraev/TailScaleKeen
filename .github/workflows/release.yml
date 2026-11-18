@@ -18,6 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 -m unittest discover -s tests -v
+      - name: Check LAN forwarding in disposable Linux network namespaces
+        run: sudo sh tests/lan-netns.sh
       - run: node --check web/app.js
       - run: sh -n install.sh && sh -n scripts/S98tailscale-panel
       - run: python3 scripts/check_public.py

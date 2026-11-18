@@ -1,9 +1,9 @@
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from panel.core import Error
+from panel.core import Error, write_json
 from panel.lan_access import LanAccess
 
 
@@ -56,6 +56,56 @@ class LanAccessTests(unittest.TestCase):
         self.assertFalse(config["devices"])
         self.assertEqual(self.access.route_rules(config),
                          {("from", "all", "to", "192.168.51.0/24", "iif", "br0", "lookup", "52")})
+
+    def test_host_route_matches_kernel_route_and_rule_output(self):
+        ip = "192.168.51.99"
+        config = self.access.normalize({**self.selection, "subnets": [ip + "/32"]})
+        self.runner.run.side_effect = lambda args, **kwargs: SimpleNamespace(stdout=(
+            f"67: from 192.168.31.22 to {ip} iif br0 lookup 52\n" if "rule" in args else
+            f"{ip} dev opkgtun0 proto static\n"))
+        self.assertEqual(self.access.route_rules(config), self.access.live_rules())
+        self.access.verify_routes(config["subnets"])
+
+    def test_interrupted_first_enable_recovers_prior_policy_on_restart(self):
+        prior = self.access.current()
+        self.access.ts.snapshot.return_value = self.snapshot
+        hook = self.access.path.parent / "lan.sh"
+        # Simulate process termination after kernel sync and accept-routes, before commit.
+        with patch("panel.lan_access.HOOK", hook), patch.object(
+            self.access, "verify_routes", side_effect=SystemExit
+        ):
+            with self.assertRaises(SystemExit):
+                self.access.change(self.selection, lambda _: None)
+        self.assertEqual(self.access.current(), prior)
+        restarted = LanAccess(self.access.path.parent, self.runner, self.access.ts, "opkgtun0")
+        self.assertTrue(restarted.needs_recovery())
+        with patch("panel.lan_access.HOOK", hook):
+            restarted.recover()
+        self.assertFalse(restarted.needs_recovery())
+        self.access.ts.run.assert_called_with("set", "--accept-routes=false")
+
+    def test_interrupted_disable_reinstalls_guards_before_accepting_routes(self):
+        prior = self.access.plan(self.selection, self.snapshot)
+        prior["restore_accept_routes"] = False
+        write_json(self.access.path, prior)
+        self.access.ts.snapshot.return_value = {**self.snapshot, "prefs": {"RouteAll": True}}
+        steps = []
+        self.access.ts.run.side_effect = lambda cmd, pref: steps.append(pref)
+        applied = self.access.sync
+        def interrupted(config, previous):
+            steps.append(config["mode"])
+            if config["mode"] == "off":
+                raise SystemExit
+            return applied(config, previous)
+        with patch.object(self.access, "sync", side_effect=interrupted), patch(
+            "panel.lan_access.HOOK", self.access.path.parent / "lan.sh"
+        ):
+            with self.assertRaises(SystemExit):
+                self.access.change({**self.selection, "mode": "off"}, lambda _: None)
+            self.access.finish_pending()
+        self.assertEqual(steps, ["--accept-routes=false", "off", "selected", "--accept-routes=true"])
+        self.assertEqual(prior, self.access.current())
+        self.assertFalse(self.access.pending.exists())
 
     def test_segment_inventory_uses_router_labels_and_only_lan_bridges(self):
         self.assertEqual(self.access.segments(), [

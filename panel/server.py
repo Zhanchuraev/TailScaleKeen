@@ -30,18 +30,12 @@ class App:
     def session(self, token):
         with self.mutex:
             record = self.sessions.get(token)
-            if (
-                record
-                and record["expires"] > time.time()
-                and (
-                    not record["user"]
-                    or (
-                        self.accounts.revision()
-                        and record.get("auth_revision") == self.accounts.revision()
-                    )
-                )
-            ):
-                return record
+            if record and record["expires"] > time.time():
+                if not record["user"]:
+                    return record
+                revision = self.accounts.revision()
+                if revision and record.get("auth_revision") == revision:
+                    return record
             self.sessions.pop(token, None)
             return None
 
@@ -410,7 +404,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             if path == "/api/actions/plan":
-                result = service.plan(data.get("action", ""), data.get("params", {}))
+                result = service.plan(data.get("action", ""), data.get("params", {}), data.get("lan_revision"))
             elif path == "/api/actions/apply":
                 result = service.apply(data.get("plan_id", ""))
             elif path == "/api/actions/cancel":
@@ -540,21 +534,27 @@ def main():
     finished = threading.Event()
 
     def maintain():
-        last_error = None
+        last_errors = {}
+        tasks = {
+            "previews": app.service.prune_plans,
+            "panel_update": app.service.panel_updater.recover,
+            "lan_access": app.service.maintain_lan_access,
+            "policies": app.service.maintain_policies,
+            "egress": app.service.maintain_egress,
+        }
         while not stopped.wait(20):
-            try:
-                app.service.prune_plans()
-                app.service.maintain_policies()
-                app.service.panel_updater.recover()
-                app.service.maintain_egress()
-                app.service.maintain_lan_access()
-                last_error = None
-            except Exception as exc:
-                # Never log response bodies or preference secrets.
-                kind = type(exc).__name__
-                if kind != last_error:
-                    app.service.event("policy_sync_failed", {"kind": kind})
-                    last_error = kind
+            for name, task in tasks.items():
+                try:
+                    task()
+                    last_errors.pop(name, None)
+                except Exception as exc:
+                    kind = type(exc).__name__
+                    if last_errors.get(name) != kind:
+                        last_errors[name] = kind
+                        try:
+                            app.service.event("policy_sync_failed", {"task": name, "kind": kind})
+                        except OSError:
+                            pass  # Keep the remaining recovery tasks running if storage is full.
 
     threading.Thread(target=maintain, daemon=True).start()
 

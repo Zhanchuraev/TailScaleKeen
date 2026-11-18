@@ -75,21 +75,25 @@ def detect_tun(config):
 
 def extract_client(blob, destination):
     destination.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(blob)) as archive:
-        for name in ["tailscale", "tailscaled"]:
-            entries = [
-                m
-                for m in archive
-                if m.isfile() and pathlib.PurePosixPath(m.name).name == name
-            ]
-            if len(entries) != 1:
+    binaries = {"tailscale", "tailscaled"}
+    found = set()
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r|*") as archive:
+        for entry in archive:
+            name = pathlib.PurePosixPath(entry.name).name
+            if name not in binaries:
+                continue
+            if not entry.isfile() or name in found:
                 raise Error("Неожиданный состав архива клиента")
             p = destination / name
-            p.write_bytes(archive.extractfile(entries[0]).read())
+            with archive.extractfile(entry) as member, p.open("wb") as output:
+                shutil.copyfileobj(member, output, length=256 * 1024)
             p.chmod(0o755)
+            found.add(name)
+    if found != binaries:
+        raise Error("Неожиданный состав архива клиента")
 
 
-def client(root, archive_path=None):
+def client(root, archive_path=None, tun="opkgtun0"):
     target = at(root, "/opt/bin")
     current = target / "tailscale"
     meta = json.loads(download(TS_BASE + "?mode=json", 1024 * 1024))
@@ -113,7 +117,7 @@ def client(root, archive_path=None):
         state = at(root, "/opt/etc/tailscale-panel")
         runner = Runner()
         ts = Tailscale(runner)
-        return Updater(state, ts, Native(state, runner), runner).update(
+        return Updater(state, ts, Native(state, runner, tun), runner).update(
             lambda x: print(x, flush=True), force=True
         )
     require_space(root, 240)
@@ -201,7 +205,6 @@ def _install(
             ]
         ),
     )
-    write_json(state / "config.json", config)
     for p in [
         "/opt/etc/init.d/S06tailscaled",
         "/opt/etc/init.d/S07tailscale-policy",
@@ -213,7 +216,8 @@ def _install(
             manifest["adopted"].append(p)
     if panel_only and not at(root, "/opt/bin/tailscale").is_file():
         raise Error("Для --panel-only нужен установленный клиент Tailscale")
-    client_result = {"changed": False, "preserved": True} if panel_only else client(root, archive)
+    client_result = {"changed": False, "preserved": True} if panel_only else client(root, archive, config["tun"])
+    write_json(state / "config.json", config)
     init = at(root, "/opt/etc/init.d/S06tailscaled")
     if not init.exists():
         init.parent.mkdir(parents=True, exist_ok=True)

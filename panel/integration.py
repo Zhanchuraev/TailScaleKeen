@@ -1,7 +1,7 @@
 """Clean-install routing before NDM policy rules; never adopt foreign helpers."""
-import ipaddress,pathlib,re,shlex
+import ipaddress,pathlib,re
 from .core import Error,read_json,write_json
-from .routing import route_rows,rule_rows
+from .routing import route_rows
 
 HOOK='/opt/etc/ndm/netfilter.d/96-tailscale-panel.sh'
 SIGNATURE='# TailScaleKeen managed integration'
@@ -58,20 +58,25 @@ class Integration:
         return [[*base,'add','pref','69','fwmark','0x80000/0xff0000','lookup','main'],
                 *[[*base,'add','pref','70','to',str(ipaddress.ip_network(net)),'lookup','52'] for net in prefixes]]
 
-    @staticmethod
-    def contains(text,args):
-        for line in text.splitlines():
-            rows=rule_rows(line)
-            if not rows or rows[0]['priority']!=int(args[5]):continue
-            row=rows[0]
-            if args[5]=='69':
-                if row.get('fwmark')=='0x80000' and row.get('fwmask')=='0xff0000' and row.get('table')=='main':return True
-            elif row.get('table')=='52':
-                m=re.search(r'\bto (\S+)',line)
+    def live_rules(self, family, owned):
+        rules = set()
+        for line in self.call(['ip', family, 'rule', 'show']).stdout.splitlines():
+            words = line.split()
+            if not words or words[0] not in ('69:', '70:'):
+                continue
+            selectors = words[1:]
+            if selectors[:2] == ['from', 'all']:
+                selectors = selectors[2:]
+            if selectors[:1] == ['to'] and len(selectors) >= 2:
                 try:
-                    if m and ipaddress.ip_network(m[1])==ipaddress.ip_network(args[7]):return True
-                except ValueError:pass
-        return False
+                    selectors[1] = str(ipaddress.ip_network(selectors[1]))
+                except ValueError:
+                    pass
+            rule = ('ip', family, 'rule', 'add', 'pref', words[0][:-1], *selectors)
+            if rule not in owned:
+                raise Error('Приоритеты ip rule 69/70 уже используются; проверьте правила маршрутизации')
+            rules.add(rule)
+        return rules
 
     @staticmethod
     def delete_rule(args):
@@ -87,29 +92,37 @@ class Integration:
     def sync(self,snapshot):
         if not read_json(self.state/'config.json').get('managed_policy_sync'):return {'managed':False}
         if snapshot.get('backend_state')!='Running':return {'managed':True,'active':False}
-        old=read_json(self.record).get('rules',[]);wanted=[]
+        record = read_json(self.record)
+        old = record.get('rules', [])
+        owned = {tuple(rule) for rule in old}
+        wanted = []
+        live = set()
         families=[4]+([6] if any(':' in x for x in (snapshot.get('self',{}).get('TailscaleIPs') or [])) else [])
+        for family_flag in sorted({'-' + str(f) for f in families} | {rule[1] for rule in owned}):
+            if family_flag not in ('-4', '-6'):
+                raise Error('Повреждён список собственных правил')
+            live.update(self.live_rules(family_flag, owned))
         for family in families:
-            existing=self.call(['ip','-'+str(family),'rule','show']).stdout
-            for line in existing.splitlines():
-                rows=rule_rows(line)
-                if rows and rows[0]['priority'] in [69,70]:
-                    row=rows[0]
-                    is_owned=any(a[1]=='-'+str(family) and self.contains(line,a) for a in old)
-                    if not is_owned:raise Error('Приоритеты ip rule 69/70 уже используются; интеграция остановлена без замены чужих правил')
             wanted+=self.rules(family,self.prefixes(snapshot,family))
         if not self.record.exists():
             for table,names in CHAINS.items():
                 for name in names:
                     if '-N '+name in self.call(['iptables','-w','-t',table,'-S',name],False).stdout:
                         raise Error('Цепочка '+name+' уже существует без записи владельца; чужие правила не заменены')
-        write_json(self.record,{'rules':wanted,'tun':self.tun})
-        for args in old:
-            if args not in wanted:self.call(self.delete_rule(args),False)
+        desired = {tuple(rule) for rule in wanted}
+        # Record new ownership before adding rules and keep old ownership until
+        # the deletes succeed. A retry can reconcile either partial outcome.
+        pending = {'rules': old + [rule for rule in wanted if tuple(rule) not in owned], 'tun': self.tun}
+        if pending != record:
+            write_json(self.record, pending)
+        for args in sorted(live - desired):
+            self.call(self.delete_rule(list(args)))
         for args in wanted:
-            family=args[1];current=self.call(['ip',family,'rule','show']).stdout
-            exists=self.contains(current,args)
-            if not exists:self.call(args)
+            if tuple(args) not in live:
+                self.call(args)
+        final = {'rules': wanted, 'tun': self.tun}
+        if final != pending:
+            write_json(self.record, final)
         for tool in ['iptables']+(['ip6tables'] if 6 in families else []):
             for table,names in CHAINS.items():
                 for name in names:
@@ -129,10 +142,14 @@ class Integration:
                     position=[]
                     if jump:
                         position=['1']
-                        if chain=='FORWARD':
-                            existing=[x for x in self.call([*prefix,'-S','FORWARD'],False).stdout.splitlines() if x.startswith('-A ')]
-                            guard=next((i for i,line in enumerate(existing) if '-j TSP_EXIT_FWD' in line),None)
-                            if guard is not None:position=[str(guard+2)]
+                        guards = {'FORWARD': {'TSKL_FWD', 'TSP_EXIT_FWD'},
+                                  'POSTROUTING': {'TSKL_NAT', 'TSP_EXIT_NAT'}}.get(chain)
+                        if guards:
+                            existing = self.call([*prefix, '-S', chain]).stdout.splitlines()
+                            jumps = [line.split() for line in existing if line.startswith('-A ')]
+                            last_guard = max((i for i, row in enumerate(jumps, 1)
+                                              if '-j' in row and row[row.index('-j') + 1] in guards), default=0)
+                            position = [str(last_guard + 1)]
                     self.call([*prefix,'-I' if jump else '-A',chain,*position,*args])
         return {'managed':True,'active':True,'prefixes':sum('to' in a for a in wanted)}
 

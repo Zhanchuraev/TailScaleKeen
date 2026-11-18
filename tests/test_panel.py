@@ -315,13 +315,10 @@ class PreferenceTests(unittest.TestCase):
     def test_new_control_server_does_not_inherit_old_exit(self):
         with tempfile.TemporaryDirectory() as d:
             s = Service(d, self.r)
-            s.connect(
-                {
-                    "server": "https://new-control.example.test",
-                    "hostname": "keenetic-test",
-                },
-                lambda _: None,
-            )
+            # The daemon is still Running on the previous server after login.
+            with self.assertRaises(Error):
+                s.connect({"server": "https://new-control.example.test",
+                           "hostname": "keenetic-test"}, lambda _: None)
             command = next(c for c in self.r.calls if "login" in c)
             self.assertIn("--exit-node=", command)
             self.assertIn("--exit-node-allow-lan-access=false", command)

@@ -72,6 +72,15 @@ class AccountHTTPTests(unittest.TestCase):
         self.assertEqual(self.req("/api/setup", fields)[0], 409)
         self.assertNotIn(fields["password"], (self.state / "auth.json").read_text())
 
+    def test_unreadable_account_cannot_be_replaced_by_setup(self):
+        path = self.state / "auth.json"
+        for broken in ("{", "{}", "[]"):
+            path.write_text(broken)
+            with self.assertRaises(Error) as failure:
+                self.app.accounts.setup(self.setup_fields())
+            self.assertEqual(failure.exception.status, 503)
+            self.assertEqual(path.read_text(), broken)
+
     def test_six_digit_password_is_allowed_and_five_digits_rejected(self):
         self.app.accounts.reset()
         self.anonymous()

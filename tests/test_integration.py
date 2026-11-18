@@ -48,3 +48,26 @@ class IntegrationTests(unittest.TestCase):
         self.runner.rules='69: from all fwmark 0x80000/0xff0000 lookup main\n70: from all to 100.64.250.2 lookup 52\n70: from all to 192.168.20.0/24 lookup 52\n'
         self.runner.calls=[];self.i.sync(SNAP)
         self.assertFalse(any(a[:4]==['ip','-4','rule','add'] for a in self.runner.calls))
+        self.assertEqual(self.runner.calls.count(['ip', '-4', 'rule', 'show']), 1)
+
+    def test_extra_selector_does_not_establish_ownership(self):
+        self.i.sync(SNAP)
+        self.runner.calls = []
+        self.runner.rules = '70: from all to 192.168.20.0/24 iif br1 lookup 52\n'
+        with self.assertRaises(Error):
+            self.i.sync(SNAP)
+        self.assertFalse(any('add' in args or 'del' in args for args in self.runner.calls))
+
+    def test_general_forwarding_and_nat_follow_both_guards(self):
+        run = self.runner.run
+        def guarded(args, **kwargs):
+            result = run(args, **kwargs)
+            if args[-2:] == ['-S', 'FORWARD']:
+                result.stdout = '-A FORWARD -j TSKL_FWD\n-A FORWARD -i opkgtun0 -j TSP_EXIT_FWD\n'
+            elif args[-2:] == ['-S', 'POSTROUTING']:
+                result.stdout = '-A POSTROUTING -j TSKL_NAT\n-A POSTROUTING -j TSP_EXIT_NAT\n'
+            return result
+        self.runner.run = guarded
+        self.i.sync(SNAP)
+        self.assertIn(['iptables','-w','-t','filter','-I','FORWARD','3','-j','TSK_FORWARD'], self.runner.calls)
+        self.assertIn(['iptables','-w','-t','nat','-I','POSTROUTING','3','-j','TSK_SNAT'], self.runner.calls)
