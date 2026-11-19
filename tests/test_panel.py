@@ -230,6 +230,8 @@ class PreferenceTests(unittest.TestCase):
         class Pending(FakeRunner):
             def run(self, args, **kw):
                 self.calls.append(args)
+                if args[-1] == "show interface OpkgTun0":
+                    return subprocess.CompletedProcess(args, 123, "Command::Base error[7405602]: argument parse error.", "")
                 text = (
                     "hostname changed\n"
                     if args[-1] == "show running-config"
@@ -253,6 +255,8 @@ class PreferenceTests(unittest.TestCase):
 
             def run(self, args, **kw):
                 command = args[-1]
+                if command == "show interface OpkgTun0":
+                    return subprocess.CompletedProcess(args, 123, "Command::Base error[7405602]: argument parse error.", "")
                 if args[:2] == ["ndmc", "-c"] and command.startswith("interface "):
                     self.calls.append(args)
                     if command == "interface OpkgTun0":

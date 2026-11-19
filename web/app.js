@@ -1,7 +1,7 @@
 'use strict';
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const E=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let session={}, data=null, page='overview', nativeData=null, query='', activeJob=null, pendingPlan=null, refreshBusy=null, credentialsBusy=false, activeDevice=null;
+let session={}, data=null, page='overview', query='', activeJob=null, pendingPlan=null, refreshBusy=null, credentialsBusy=false, activeDevice=null;
 let lanDraft=null, preparingPlan=false;
 const pages={overview:'Системный монитор',exit:'Выход в интернет',peers:'Клиенты',routes:'Подсети и DNS','lan-access':'Доступ устройств',native:'Подключение Keenetic',diagnostics:'Диагностика',logs:'Журналы',backups:'Резервные копии',system:'Клиент и панель'};
 const labels={accept_dns:'Принимать DNS с сервера',accept_routes:'Принимать маршруты подсетей',allow_lan:'Доступ к своей LAN при использовании внешнего Exit node',shields_up:'Блокировать входящие подключения',ssh:'Tailscale SSH',webclient:'Встроенный веб-клиент',snat:'SNAT подсетей',stateful:'Фильтрация соединений'};
@@ -55,7 +55,61 @@ function overview(){const s=data.tailscale,p=s.prefs,exit=selectedExit(),own=s.s
 function exitView(){const s=data.tailscale,p=s.prefs,selected=selectedExit(),nodes=s.peers.filter(n=>n.ExitNodeOption);return intro('Выход в интернет','Настройка внешнего Exit node и раздачи интернета через этот роутер.')+`<div class="split"><section class="surface"><div class="section-heading"><h2>Выход через другое устройство</h2><span class="pill">${nodes.length} доступно</span></div><div class="node-choice ${!selected?'selected':''}"><div><h3>Прямое подключение</h3><p>Не использовать другой Exit node</p></div><button data-exit="" ${!selected?'disabled':''}>${!selected?'Выбрано':'Выбрать'}</button></div>${nodes.map(n=>`<div class="node-choice ${n.ID===p.ExitNodeID?'selected':''}"><div><h3>${E(n.HostName)} ${n.ID===p.ExitNodeID?'<span class="pill">Текущий</span>':''}</h3><p>${goodBadge(n.Online)} · ${E(address(n))} · ${E(n.OS||'Устройство')}</p></div><button data-exit="${E(n.ID)}" ${!n.Online||n.ID===p.ExitNodeID?'disabled':''}>${n.ID===p.ExitNodeID?'Выбран':'Выбрать'}</button></div>`).join('')}${nodes.length?'':'<p class="empty">В сети пока нет одобренных Exit nodes. Сначала включите эту роль на одном из устройств и разрешите её в консоли сервера.</p>'}<form id="exit-options">${check('allow_lan','Доступ к своей LAN','Исключение для локальной сети при использовании внешнего Exit node. Не управляет объявлением подсетей.',p.ExitNodeAllowLANAccess)}<div class="form-actions"><button type="submit" ${!selected?'disabled':''}>Сохранить доступ к LAN</button></div></form></section><section class="surface"><h2>Этот роутер — Exit node</h2><p class="muted">Другие устройства смогут использовать интернет-подключение вашего роутера.</p><form id="advertise-form">${check('advertise_exit','Раздавать интернет в Tailscale','Объявить этот роутер как выходной узел.',s.exit_advertised)}<div class="note">После включения разрешите маршруты <code>0.0.0.0/0</code> и <code>::/0</code> в консоли Tailscale / Headscale.</div><div class="form-actions"><button type="submit" class="primary">Проверить и применить</button></div></form><div id="egress-section" class="egress-control"><h3>Через что раздавать интернет</h3><p class="muted">Получение политик подключений…</p></div><div class="keyline"></div><h3>Проверка выхода</h3><p class="muted small">HTTPS-запрос через интерфейс Tailscale без изменения настроек.</p><button data-diag="exit">Проверить выход</button></section></div>`}
 function peersView(){const all=[{...data.tailscale.self,Online:data.tailscale.online,is_self:true},...data.tailscale.peers];const peers=all.filter(n=>[n.HostName,n.DNSName,...(n.TailscaleIPs||[]),data.devices?.[n.ID]?.notes].join(' ').toLowerCase().includes(query.toLowerCase()));return intro('Клиенты','Клиенты сети Tailscale, их веб-интерфейсы и ваши личные заметки.')+`<section class="surface"><div class="section-heading"><h2>Узлы сети <span class="pill">${all.length}</span></h2><input id="peer-search" class="search" type="search" aria-label="Найти клиента" placeholder="Имя, IP или заметка" value="${E(query)}"></div>${peerTable(peers)}<p class="device-help">«Панель» открывает управление этим роутером. «Веб» — адрес другого узла, обычно Tailscale :5252. Это ссылка, а не подтверждение доступности: нужен включённый веб-клиент и доступ через Tailscale. На Headscale 0.29.7 встроенный веб-клиент работает для просмотра сведений. Другой адрес и заметку можно задать в карточке.</p></section>`}
 function routesView(){const p=data.tailscale.prefs;return intro('Подсети и DNS','Управление маршрутами клиента без перезаписи остальных параметров.', '<a class="button-link" href="#lan-access">Настроить доступ устройств</a>')+`<div class="split"><section class="surface"><h2>Маршруты подсетей</h2><form id="routes-form"><label>Подсети за этим роутером<textarea name="routes" spellcheck="false" placeholder="192.168.10.0/24">${E((p.AdvertiseRoutes||[]).filter(x=>!x.endsWith('/0')).join('\n'))}</textarea></label><p class="muted small">По одной сети в строке. После объявления разрешите маршруты в консоли сервера.</p><button type="submit" class="primary">Проверить маршруты</button></form><div class="keyline"></div><form id="route-options">${check('accept_routes','Принимать маршруты других устройств','Использовать доступные подсети вашей сети Tailscale.',p.RouteAll)}${check('snat','SNAT для маршрутов подсетей','Подменять адрес источника при доступе из Tailscale в локальные сети.',!p.NoSNAT)}${check('stateful','Фильтрация перенаправленных соединений','Отслеживать состояния соединений между интерфейсами.',!p.NoStatefulFiltering)}<div class="form-actions"><button type="submit">Сохранить параметры</button></div></form></section><section class="surface"><h2>DNS и доступ</h2><form id="dns-form">${check('accept_dns','Принимать DNS с сервера','На Keenetic обычно выключено, чтобы сохранить штатный DNS роутера.',p.CorpDNS)}${check('shields_up','Блокировать входящие подключения','Узел останется в сети, но перестанет принимать входящие подключения от пиров.',p.ShieldsUp)}<div class="form-actions"><button type="submit">Сохранить DNS и доступ</button></div></form><div class="note">Настройки DHCP и DNS в самой KeeneticOS эта панель не заменяет.</div><div class="keyline"></div><h3>Объявленные другими узлами сети</h3>${pairs(data.tailscale.peers.filter(n=>n.PrimaryRoutes?.length).map(n=>[n.HostName,E(n.PrimaryRoutes.join(', '))]))}</section></div>`}
-function nativeView(){const n=nativeData;if(!n)return intro('Подключение Keenetic','Подключение OpkgTun в штатном списке соединений роутера.')+'<section class="surface muted">Читаю настройки подключения…</section>';return intro('Подключение Keenetic','Создайте подключение Tailscale в интерфейсе Keenetic / Netcraze, как обычное интернет-соединение.')+`<div class="split"><section class="surface"><div class="section-heading"><h2>${E(n.name)}</h2><span class="status-badge ${n.exists?'good':'warn'}">${n.exists?'Подключение существует':'Не создано'}</span></div>${!n.available?`<div class="alert">${E(n.error)}</div>`:''}<form id="native-form"><label>Название подключения<input name="description" value="${E(n.description||'Tailscale')}" maxlength="50" ${n.exists?'disabled':''}></label><div class="form-grid"><label>Интерфейс<input value="${E(n.name)}" disabled></label><label>MTU<select name="mtu" ${n.exists?'disabled':''}>${[1280,1360,1420,1500].map(m=>`<option value="${m}" ${m==n.mtu?'selected':''}>${m}</option>`).join('')}</select></label></div>${check('global','Показывать как интернет-подключение','Позволяет выбрать соединение в политиках подключений роутера.',n.exists?n.global:true)}${check('save','Сохранить в конфигурацию роутера','Созданное подключение сохранится после перезагрузки.',true)}<div class="form-actions"><button class="primary" type="submit" ${!n.available?'disabled':''}>${n.exists?'Проверить существующее':'Создать подключение'}</button></div></form><div class="note">${n.exists?'Существующие параметры OpkgTun сохраняются. Повторная проверка не создаёт дубликат.':'Tailscale управляет адресами туннеля сам. Вручную задавать ему IP-адрес не нужно.'}</div></section><section class="surface"><h2>Связь с политиками</h2>${pairs([['Интерфейс Linux',E(n.tun||data.config.tun)],['Состояние',n.connected?'Подключён':'Не подключён'],['Создан панелью',n.managed?'Да':'Существующее подключение']])}<h3>Обнаруженные политики</h3>${(n.policies||[]).length?pairs(n.policies.map(p=>[p.name,'Таблица '+E(p.table)])):'<p class="muted small">Политик с этим подключением пока не обнаружено.</p>'}<div class="note">Назначение устройств и приоритеты соединений остаются в штатном веб-конфигураторе Keenetic. Панель сохраняет существующие политики.</div><a href="/" id="router-link" target="_blank" rel="noopener">Открыть панель роутера</a></section></div>`}
+function nativeView(){
+ const button='<button type="button" id="native-check">Проверить подключение</button>';
+ return intro('Подключение Keenetic','Регистрация туннеля Tailscale в KeeneticOS.',button)+
+  '<div id="native-status" aria-busy="true"><section class="surface muted" role="status">Читаю настройки подключения…</section></div>';
+}
+let nativeRequest=null, nativeJobId=null;
+function nativeResult(n){
+ if(!n.available)return `<section class="surface"><h2>Не удалось проверить подключение</h2><p role="alert">${E(n.error||'KeeneticOS не вернула состояние интерфейса.')}</p></section>`;
+ const routerLink=`<a href="${E(location.protocol+'//'+location.hostname+'/')}" target="_blank" rel="noopener">Открыть веб-конфигуратор роутера</a>`;
+ if(!n.exists)return `<section class="surface"><div class="section-heading"><h2>${E(n.name)}</h2><span class="status-badge warn">Отсутствует</span></div>
+  <p>Создайте запись для туннеля <code>${E(n.tun)}</code>, чтобы KeeneticOS распознавала его в таблице маршрутов.</p>
+  <form id="native-form"><details><summary>Параметры подключения</summary>
+  <div class="form-grid"><label>Название подключения<input name="description" value="Tailscale" maxlength="50" required></label>
+  <label>MTU<select name="mtu">${[1280,1360,1420,1500].map(m=>`<option>${m}</option>`).join('')}</select></label></div>
+  ${check('global','Показывать в «Приоритетах подключений» Keenetic',n.priority_available?'Tailscale получит приоритет 1, ниже действующего приоритета основного интернет-подключения.':'KeeneticOS не подтвердила основной выход с более высоким приоритетом. Доступна регистрация туннеля без добавления в этот список.',n.priority_available===true)}
+  ${check('save','Сохранить после перезагрузки','Записать подключение в конфигурацию KeeneticOS.',true)}</details>
+  <p class="muted small">Если туннель уже работает, при его регистрации связь через Tailscale может ненадолго прерваться.</p>
+  <div class="form-actions"><button class="primary" type="submit" ${nativeJobId?'disabled':''}>Создать подключение Tailscale</button></div></form></section>`;
+ const policies=n.policies||[];
+ return `<div class="split"><section class="surface"><div class="section-heading"><h2>${E(n.description||n.name)}</h2><span class="status-badge good">Зарегистрировано</span></div>
+  ${pairs([['Интерфейс KeeneticOS',E(n.name)],['Тип','OpkgTun'],['Интерфейс Linux',E(n.tun)],['Состояние',n.connected?'Подключён':'Отключён'],['MTU',E(n.mtu)],['В «Приоритетах подключений»',n.global?'Да':'Нет']])}
+  ${routerLink}</section><section class="surface"><h2>Связанные политики</h2>
+  ${policies.length?pairs(policies.map(p=>[p.name,'Таблица '+E(p.table)])):'<p class="muted">Политик с этим подключением пока нет.</p>'}</section></div>`;
+}
+async function checkNativeConnection(){
+ const root=$('#native-status'),button=$('#native-check');
+ if(!root||!session.authenticated)return;
+ button.disabled=true;button.textContent='Проверяю…';root.setAttribute('aria-busy','true');
+ const oldForm=$('#native-form',root);
+ if(oldForm)oldForm.querySelector('[type=submit]').disabled=true;
+ if(!nativeRequest)nativeRequest=api('/api/native').finally(()=>{nativeRequest=null;});
+ let result;
+ try{result=await nativeRequest;}catch(error){result={available:false,error:error.message};}
+ if(!root.isConnected||!session.authenticated)return;
+ const draft=oldForm?fields(oldForm,['description','mtu','global','save']):null;
+ const expanded=oldForm?.querySelector('details').open;
+ root.innerHTML=nativeResult(result);
+ root.setAttribute('aria-busy','false');
+ button.disabled=false;button.textContent='Проверить подключение';
+ const form=$('#native-form',root);
+ if(form){
+  form.elements.global.disabled=result.priority_available!==true;
+  if(draft){
+   form.elements.description.value=draft.description;form.elements.mtu.value=draft.mtu;
+   if(!form.elements.global.disabled&&!oldForm.elements.global.disabled)form.elements.global.checked=draft.global;
+   form.elements.save.checked=draft.save;
+   form.querySelector('details').open=expanded;
+  }
+  form.onsubmit=e=>{
+   e.preventDefault();
+   if(!nativeJobId&&!nativeRequest)plan('native_create',{description:form.elements.description.value,mtu:Number(form.elements.mtu.value),global:form.elements.global.checked,save:form.elements.save.checked});
+  };
+ }
+ decorateFields(root);
+}
 function diagnosticsView(){return intro('Диагностика','Проверки выполняются на роутере и не меняют его сетевые настройки.')+`
  <section class="surface"><div class="section-heading"><h2>Состояние панели и клиента</h2><div class="actions"><button id="check-health" class="primary">Проверить состояние</button><a href="/api/support-report" download>Скачать отчёт</a></div></div><p class="muted small">Версии компонентов, интерфейс, права доступа и место для обновлений. Отчёт не включает адреса, имена устройств, сервер управления, заметки, журналы и ключи.</p><div id="health-result" aria-live="polite"></div></section>
  <div class="split"><section class="surface"><h2>Проверки сети</h2><div class="node-choice"><div><h3>Соединение и DERP</h3><p>NAT, UDP и доступность серверов ретрансляции.</p></div><button data-diag="netcheck">Проверить</button></div><div class="node-choice"><div><h3>Выход в интернет</h3><p>HTTPS-запрос через ${E(data.config.tun)}.</p></div><button data-diag="exit">Проверить</button></div><div class="node-choice"><div><h3>Правила маршрутизации</h3><p>Просмотр действующих правил IPv4.</p></div><button data-diag="routes">Показать</button></div></section>
@@ -373,7 +427,7 @@ function bindLanAccess(){
 }
 
 const renderers={overview,exit:exitView,peers:peersView,routes:routesView,'lan-access':lanAccessView,native:nativeView,diagnostics:diagnosticsView,logs:logsView,backups:backupsView,system:()=>systemView()+panelAccessView()};
-async function render(){if(!data)return;page=location.hash.slice(1)||'overview';if(!pages[page])page='overview';$('#page-title').textContent=pages[page];$$('#nav a').forEach(a=>{a.classList.toggle('active',a.dataset.page===page);if(a.dataset.page===page)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});$('#main').className='page-'+page;$('#main').innerHTML=renderers[page]();decorateFields($('#main'));bindView();bindPanelAccess();bindLanAccess();if(page==='native'&&!nativeData){try{nativeData=await api('/api/native');if(page==='native')render()}catch(e){toast(e.message,true)}}if(page==='exit')loadEgress();if(page==='logs')loadLogs();if(page==='backups')loadBackups();if(page==='system')loadPanelSettings()}
+async function render(){if(!data)return;page=location.hash.slice(1)||'overview';if(!pages[page])page='overview';$('#page-title').textContent=pages[page];$$('#nav a').forEach(a=>{a.classList.toggle('active',a.dataset.page===page);if(a.dataset.page===page)a.setAttribute('aria-current','page');else a.removeAttribute('aria-current')});$('#main').className='page-'+page;$('#main').innerHTML=renderers[page]();decorateFields($('#main'));bindView();bindPanelAccess();bindLanAccess();if(page==='native'){ $('#native-check').onclick=checkNativeConnection; await checkNativeConnection(); }if(page==='exit')loadEgress();if(page==='logs')loadLogs();if(page==='backups')loadBackups();if(page==='system')loadPanelSettings()}
 async function refresh(manual=false,completedJob=null){
  if(credentialsBusy||!session.authenticated)return;
  if(refreshBusy){
@@ -390,7 +444,6 @@ async function refresh(manual=false,completedJob=null){
   if(manual){
    if(origin!==$('#main').firstElementChild)return;
    if(lanDraft?.changed()&&!window.confirm('Загрузить сохранённые правила с роутера и сбросить изменения на экране?'))return;
-   nativeData=null;
    await render();
    toast('Данные обновлены');
   }else if(completedJob){
@@ -423,14 +476,18 @@ async function plan(action,params={},revision){
   $('#confirm-commands').textContent=preview.commands.map(x=>Array.isArray(x)?x.join(' '):x).join('\n');
   $('#command-details').hidden=!preview.commands.length;
   $('#confirm-apply').textContent=preview.changes.length?'Применить':'Подтвердить проверку';
-  pendingPlan={id:preview.id,savedDraft};
+  pendingPlan={id:preview.id,savedDraft,action};
   if(action==='update_panel')pendingPlan.update={version:preview.version||preview.changes[0].after,transaction:preview.transaction||null};
   $('#confirm').showModal();
  }catch(e){toast(e.message,true)}finally{preparingPlan=false;}
 }
 function formatValue(x){return Array.isArray(x)?x.join(', ')||'Нет':typeof x==='boolean'?x?'Включено':'Выключено':x??'Нет'}
-async function showJob(id,savedDraft=null){
- const job={id,savedDraft};
+async function showJob(id,savedDraft=null,action=null){
+ const job={id,savedDraft,action};
+ if(action==='native_create'){
+  nativeJobId=id;
+  const create=$('#native-form [type=submit]');if(create)create.disabled=true;
+ }
  activeJob=job;
  $('#job-title').textContent='Выполнение';
  $('#job-state').textContent='Загрузка…';
@@ -441,10 +498,18 @@ async function showJob(id,savedDraft=null){
  await pollJob(job);
 }
 async function pollJob(job){
- if(job!==activeJob)return;
+ const native=job.action==='native_create';
+ if(job!==activeJob&&!native)return;
  try{
   const j=await api('/api/jobs/'+job.id);
-  if(job!==activeJob||!$('#job-dialog').open)return;
+  if(native&&j.state!=='running'&&nativeJobId===job.id)nativeJobId=null;
+  if(job!==activeJob||!$('#job-dialog').open){
+   if(native&&session.authenticated){
+    if(j.state==='running')setTimeout(()=>pollJob(job),1200);
+    else await checkNativeConnection();
+   }
+   return;
+  }
   $('#job-title').textContent=j.label;
   $('#job-state').textContent={running:'Выполняется',done:'Готово',error:'Ошибка',interrupted:'Прервано'}[j.state]||j.state;
   $('#job-state').className='status-badge '+(j.state==='done'?'good':j.state==='error'?'bad':'warn');
@@ -466,13 +531,15 @@ async function pollJob(job){
    activeJob=null;
    await refresh(false,{savedDraft:j.state==='done'?job.savedDraft:null});
   }
- }catch(e){if(job===activeJob){toast(e.message,true);activeJob=null;}}
+ }catch(e){
+  if(native&&nativeJobId===job.id){nativeJobId=null;void checkNativeConnection();}
+  if(job===activeJob){toast(e.message,true);activeJob=null;}
+ }
 }
 function fields(form,names){const r={};for(const n of names){const x=form.elements[n];r[n]=x.type==='checkbox'?x.checked:x.value}return r}
 function bindView(){const root=$('#main');$$('[data-copy-address]',root).forEach(b=>b.onclick=()=>copyAddress(b.dataset.copyAddress,b));$$('[data-action]',root).forEach(b=>b.onclick=()=>plan(b.dataset.action));$$('[data-exit]',root).forEach(b=>b.onclick=()=>plan('settings',{exit_node:b.dataset.exit}));$$('[data-diag]',root).forEach(b=>b.onclick=()=>diagnose(b.dataset.diag));$$('[data-ping]',root).forEach(b=>b.onclick=()=>diagnose('ping',b.dataset.ping));$$('[data-job]',root).forEach(b=>b.onclick=()=>showJob(b.dataset.job));$$('[data-device]',root).forEach(b=>b.onclick=()=>openDevice(b.dataset.device));
 const forms={'exit-options':['allow_lan'],'advertise-form':['advertise_exit'],'route-options':['accept_routes','snat','stateful'],'dns-form':['accept_dns','shields_up'],'advanced-form':['hostname','netfilter','ssh','webclient']};for(const [id,names] of Object.entries(forms)){const form=$('#'+id);if(form)form.onsubmit=e=>{e.preventDefault();plan('settings',fields(form,names))}}
 if($('#routes-form'))$('#routes-form').onsubmit=e=>{e.preventDefault();plan('settings',{routes:e.target.elements.routes.value.split(/[\n,]+/).map(x=>x.trim()).filter(Boolean)})};
-if($('#native-form')){if(nativeData.exists){$('#native-form').elements.global.disabled=true;$('#native-form').elements.save.disabled=true;}$('#native-form').onsubmit=e=>{e.preventDefault();const f=e.target;plan('native_create',nativeData.exists?{}:{description:f.elements.description.value,mtu:Number(f.elements.mtu.value),global:f.elements.global.checked,save:f.elements.save.checked})};const u=new URL(location.href);u.port='';u.pathname='/';u.hash='';u.search='';$('#router-link').href=u.href}
 if($('#ping-form'))$('#ping-form').onsubmit=e=>{e.preventDefault();diagnose(e.target.elements.kind.value,e.target.elements.target.value)};
 if($('#connect-form'))$('#connect-form').onsubmit=e=>{e.preventDefault();const f=e.target,params=fields(f,['server','hostname','auth_key']);plan('connect',params);f.elements.auth_key.value=''};
 if($('#peer-search'))$('#peer-search').oninput=e=>{query=e.target.value;const cursor=e.target.selectionStart;$('#main').innerHTML=peersView();bindView();$('#peer-search').focus();$('#peer-search').setSelectionRange(cursor,cursor)};
@@ -516,7 +583,7 @@ $('#confirm-apply').onclick=async()=>{
   const job=await api('/api/actions/apply',{plan_id:preview.id});
   pendingPlan=null;
   $('#confirm').close();
-  await showJob(job.id,preview.savedDraft);
+  await showJob(job.id,preview.savedDraft,preview.action);
  }catch(e){toast(e.message,true)}finally{button.disabled=false;}
 };
 for(const type of ['cancel','submit'])$('#confirm').addEventListener(type,event=>{

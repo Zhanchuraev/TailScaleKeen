@@ -1,7 +1,8 @@
-"""Install a bundled release without modifying an existing daemon integration."""
+"""Install a bundled release and register its Tailscale tunnel in KeeneticOS."""
 
-import argparse, hashlib, io, json, os, pathlib, re, secrets, shutil, socket, subprocess, tarfile
-from .core import Error, VERSION, download, read_json, write_json
+import argparse, hashlib, io, json, os, pathlib, re, secrets, shutil, socket, subprocess, tarfile, time
+from .core import Error, Runner, VERSION, download, read_json, write_json
+from .native import Native, blocks
 
 TS_BASE = "https://pkgs.tailscale.com/stable/"
 
@@ -30,47 +31,93 @@ def install_launchers(root, source):
     init.chmod(0o755)
 
 
-def detect_tun(config):
-    """Adopt one supported daemon or choose an unused native TUN for a clean install."""
+def init_tun(init):
+    """Read a literal TUN from the supported Entware service without executing it."""
+    script = "\n".join(line for line in init.read_text().splitlines() if not line.lstrip().startswith("#"))
+    values = set(re.findall(r"""(?<![\w-])--tun(?:=|[ \t]+)["']?([^\s"';\\]+)""", script))
+    if len(values) != 1:
+        raise Error("Не удалось однозначно определить TUN существующей службы S06tailscaled")
+    value = values.pop()
+    if not re.fullmatch(r"opkgtun(?:[0-9]|1[0-5])", value):
+        raise Error("Неподдерживаемый TUN существующей службы S06tailscaled")
+    return value
+
+
+def running_tun(root="/"):
+    """Identify exactly one running Entware-managed daemon before any stop/start."""
     processes = []
-    for directory in pathlib.Path("/proc").glob("[0-9]*"):
+    for directory in at(root, "/proc").glob("[0-9]*"):
         try:
-            if (directory / "comm").read_text().strip() == "tailscaled":
-                args = (directory / "cmdline").read_bytes().decode().split("\0")
-                exe = os.readlink(directory / "exe").removesuffix(" (deleted)")
-                processes.append((args, exe))
-        except (OSError, UnicodeError):
+            if (directory / "comm").read_text().strip() != "tailscaled":
+                continue
+            args = (directory / "cmdline").read_bytes().decode().split("\0")
+            exe = os.readlink(directory / "exe").removesuffix(" (deleted)")
+            processes.append((args, exe))
+        except (FileNotFoundError, ProcessLookupError):
             continue
-    if len(processes) > 1:
+        except (OSError, UnicodeError) as exc:
+            raise Error("Не удалось проверить работающий процесс tailscaled") from exc
+    if not processes:
+        return None
+    if len(processes) != 1:
         raise Error("Найдено несколько tailscaled; автоматическая установка остановлена")
-    init = pathlib.Path("/opt/etc/init.d/S06tailscaled")
-    if not init.is_file() and any(pathlib.Path(p).exists() for p in ["/opt/bin/tailscale", "/opt/sbin/tailscale", "/opt/sbin/tailscaled"]):
+    args, exe = processes[0]
+    init = at(root, "/opt/etc/init.d/S06tailscaled")
+    if pathlib.Path(exe).resolve() != at(root, "/opt/bin/tailscaled").resolve() or not init.is_file():
+        raise Error("Существующий клиент использует неподдерживаемую схему запуска")
+    flags = set()
+    for i, arg in enumerate(args):
+        if arg.startswith("--tun="):
+            flags.add(arg.split("=", 1)[1])
+        elif arg == "--tun":
+            flags.add(args[i + 1] if i + 1 < len(args) else "")
+    expected = init_tun(init)
+    if flags != {expected}:
+        raise Error("TUN службы S06tailscaled не совпадает с работающим клиентом")
+    return expected
+
+
+def detect_tun(config, root="/"):
+    """Adopt one supported daemon or choose an unused native TUN for a clean install."""
+    init = at(root, "/opt/etc/init.d/S06tailscaled")
+    detected = running_tun(root)
+    if not init.is_file() and any(at(root, p).exists() for p in ["/opt/bin/tailscale", "/opt/bin/tailscaled", "/opt/sbin/tailscale", "/opt/sbin/tailscaled"]):
         raise Error("Клиент найден без поддерживаемой службы S06tailscaled; автоматическая замена остановлена")
-    detected = None
-    if processes:
-        args, exe = processes[0]
-        detected = next((x.split("=", 1)[1] for x in args if x.startswith("--tun=")), None)
-        if pathlib.Path(exe).resolve() != pathlib.Path("/opt/bin/tailscaled").resolve() or not init.is_file() or not detected:
-            raise Error("Существующий клиент использует неподдерживаемую схему запуска; файлы не заменены")
-    elif init.is_file():
-        match = re.search(r"--tun=(opkgtun\d+)", init.read_text())
-        if not match:
-            raise Error("Не удалось определить TUN существующей службы S06tailscaled")
-        detected = match[1]
+    if detected is None and init.is_file():
+        detected = init_tun(init)
     value = config.get("tun") or detected
     if config.get("tun") and detected and config["tun"] != detected:
         raise Error("TUN панели не совпадает с работающим клиентом")
     if value and not re.fullmatch(r"opkgtun(?:[0-9]|1[0-5])", value):
         raise Error("Поддерживаются только OpkgTun0…OpkgTun15")
-    if value:
+    if detected:
         return value
-    from .native import blocks
-    p = subprocess.run(["ndmc", "-c", "show running-config"], capture_output=True, text=True, timeout=20, check=True)
+    p = Runner().run(["ndmc", "-c", "show running-config"], check=False)
     used = blocks(p.stdout)
+    if p.returncode or not used:
+        raise Error("Не удалось прочитать интерфейсы KeeneticOS для выбора свободного OpkgTun")
     for index in range(16):
-        if "OpkgTun" + str(index) not in used and not pathlib.Path("/sys/class/net/opkgtun" + str(index)).exists():
-            return "opkgtun" + str(index)
+        tun = "opkgtun" + str(index)
+        if value and value != tun:
+            continue
+        if "OpkgTun" + str(index) not in used and not at(root, "/sys/class/net/" + tun).exists():
+            return tun
+    if value:
+        raise Error("Сохранённый TUN уже занят, а служба Tailscale не найдена: " + value)
     raise Error("Свободный OpkgTun не найден")
+
+
+def ensure_client_running(init, expected):
+    actual = running_tun()
+    if actual is None:
+        Runner().run([str(init), "start"], timeout=65)
+        for _ in range(20):
+            actual = running_tun()
+            if actual is not None:
+                break
+            time.sleep(0.25)
+    if actual != expected:
+        raise Error("Не подтверждён запуск tailscaled с интерфейсом " + expected)
 
 
 def extract_client(blob, destination):
@@ -154,7 +201,8 @@ def _install(
     source, root="/", auth_source=None, port=8092, no_start=False, archive=None, panel_only=False
 ):
     source = pathlib.Path(source).resolve()
-    root = str(pathlib.Path(root).resolve())
+    if root != "/":
+        root = str(pathlib.Path(root).resolve())
     target = at(root, "/opt/share/tailscale-panel")
     state = at(root, "/opt/etc/tailscale-panel")
     if (
@@ -212,12 +260,11 @@ def _install(
         "/opt/etc/ndm/netfilter.d/99-tailscale.sh",
     ]:
         file = at(root, p)
-        if file.is_file() and p not in manifest["adopted"]:
+        if file.is_file() and p not in manifest["created"] and p not in manifest["adopted"]:
             manifest["adopted"].append(p)
     if panel_only and not at(root, "/opt/bin/tailscale").is_file():
         raise Error("Для --panel-only нужен установленный клиент Tailscale")
     client_result = {"changed": False, "preserved": True} if panel_only else client(root, archive, config["tun"])
-    write_json(state / "config.json", config)
     init = at(root, "/opt/etc/init.d/S06tailscaled")
     if not init.exists():
         init.parent.mkdir(parents=True, exist_ok=True)
@@ -226,6 +273,14 @@ def _install(
         )
         init.chmod(0o755)
         manifest["created"].append("/opt/etc/init.d/S06tailscaled")
+        write_json(state / "manifest.json", manifest)
+    if root == "/":
+        native = Native(state, tun=config["tun"])
+        native.create(native.default_fields(), lambda message: print(message, flush=True))
+        print("Подключение KeeneticOS: " + native.name, flush=True)
+        if not no_start:
+            ensure_client_running(init, config["tun"])
+    write_json(state / "config.json", config)
     if source != target:
         stage = at(root, "/opt/share/.tailscale-panel-new")
         previous = at(root, "/opt/share/.tailscale-panel-previous")
@@ -285,12 +340,6 @@ def _install(
     manifest["version"] = VERSION
     write_json(state / "manifest.json", manifest)
     if root == "/" and not no_start:
-        if not subprocess.run(
-            ["pidof", "tailscaled"], capture_output=True
-        ).stdout.strip():
-            subprocess.run(
-                ["/opt/etc/init.d/S06tailscaled", "start"], timeout=65, check=True
-            )
         subprocess.run(
             ["/opt/etc/init.d/S98tailscale-panel", "start"], timeout=35, check=True
         )
@@ -320,7 +369,10 @@ def main():
     p.add_argument("--client-archive")
     p.add_argument("--panel-only", action="store_true")
     a = p.parse_args()
-    install(a.source, a.root, a.auth_source, a.port, a.no_start, a.client_archive, a.panel_only)
+    try:
+        install(a.source, a.root, a.auth_source, a.port, a.no_start, a.client_archive, a.panel_only)
+    except Error as exc:
+        p.exit(1, f"Установка TailScaleKeen остановлена. {exc}\n")
 
 
 if __name__ == "__main__":
