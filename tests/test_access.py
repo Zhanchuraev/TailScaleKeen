@@ -324,6 +324,20 @@ class InstallerAccountTests(unittest.TestCase):
         self.assertEqual((self.state / "auth.json").read_bytes(), old)
         self.assertFalse((self.state / "setup.token").exists())
 
+    def test_new_panel_listens_on_all_ipv4_interfaces(self):
+        self.install()
+        config = read_json(self.state / "config.json")
+        self.assertEqual((config["bind"], config["port"]), ("0.0.0.0", 8092))
+
+    def test_panel_only_reinstall_preserves_explicit_listener(self):
+        client = self.root / "opt/bin/tailscale"
+        client.parent.mkdir(parents=True)
+        client.touch()
+        write_json(self.state / "config.json", {"bind": "192.0.2.17", "port": 8192})
+        self.install(panel_only=True)
+        config = read_json(self.state / "config.json")
+        self.assertEqual((config["bind"], config["port"]), ("192.0.2.17", 8192))
+
     def test_legacy_migration_preserves_external_credentials(self):
         external = self.root / "xkeen-auth.json"
         write_json(
