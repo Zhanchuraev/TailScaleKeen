@@ -1,4 +1,4 @@
-import contextlib, http.client, json, pathlib, socket, tempfile, time, unittest, io
+import contextlib, http.client, json, pathlib, socket, tempfile, threading, time, unittest, io
 from unittest.mock import patch
 import test_panel as base
 from panel.server import App, Server, Handler, password_hash
@@ -45,6 +45,46 @@ class AccountHTTPTests(unittest.TestCase):
         write_json(self.state / "panel-update/transaction.json", {"state": "installing", "started_at": time.time()})
         self.assertEqual(self.req("/api/backups", {})[0], 409)
         self.assertEqual(self.req("/api/panel-port/begin", {"port": 8193})[0], 409)
+
+    def test_anonymous_update_receipt_tracks_only_its_job_from_preparation_to_error(self):
+        self.login()
+        updater = self.app.service.panel_updater
+        updater.check = lambda *_: {"latest": "9.0.0", "available": True}
+        write_json(updater.journal, {"id": "a"*24, "version": "9.0.0", "state": "done"})
+        release = threading.Event()
+        started = threading.Event()
+        def fail(log, version, transaction):
+            started.set()
+            release.wait(5)
+            raise Error("private failure detail")
+        updater.prepare = fail
+        status, plan, _ = self.req("/api/actions/plan", {"action": "update_panel", "params": {}})
+        self.assertEqual(status, 200)
+        tid = plan["transaction"]
+        self.assertNotEqual(tid, plan["id"])
+        def receipt():
+            _, session, _ = self.req("/api/session?update_id=" + tid, headers={"Cookie": ""})
+            self.assertFalse(session["authenticated"])
+            return session["panel_update"]
+        with patch("panel.core.operation_lock", lambda _: contextlib.nullcontext()):
+            self.assertEqual(receipt(), {})
+            self.login()
+            _, job, _ = self.req("/api/actions/apply", {"plan_id": plan["id"]})
+            try:
+                self.assertEqual(job["id"], tid)
+                self.assertTrue(started.wait(3))
+                self.assertEqual(receipt()["state"], "preparing")
+            finally:
+                release.set()
+                with self.app.service.jobs.lock:
+                    pass
+        result = receipt()
+        self.assertEqual((result["id"], result["version"], result["state"]), (tid, "9.0.0", "error"))
+        self.assertIn("finished_at", result)
+        self.assertNotIn("private", json.dumps(result))
+        unrelated = "b"*24
+        write_json(self.state / "jobs" / (unrelated+".json"), {"id": unrelated, "state": "running", "label": "other"})
+        self.assertEqual(self.req("/api/session?update_id="+unrelated)[1]["panel_update"], {})
 
     def setup_fields(self, **changes):
         d = {

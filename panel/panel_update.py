@@ -7,6 +7,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import secrets
 import shutil
 import subprocess
@@ -14,6 +15,32 @@ import sys
 import time
 from .core import Error, VERSION, operation_lock, read_json, write_json
 from .releases import release_info, fetch_release
+
+PUBLIC_MESSAGES = {
+    "preparing": "Подготовка обновления панели",
+    "prepared": "Архив проверен, ожидается перезапуск панели",
+    "installing": "Установка новой версии панели",
+    "checking": "Проверка запуска новой версии панели",
+    "done": "Обновление панели завершено",
+    "error": "Обновление панели не завершено. Подробности доступны после входа.",
+    "rolled_back": "Обновление отменено, восстановлена предыдущая версия панели",
+}
+
+
+def public_receipt(record):
+    state = record.get("state")
+    if not isinstance(state, str) or state not in PUBLIC_MESSAGES:
+        return {}
+    receipt = {"state": state, "message": PUBLIC_MESSAGES[state]}
+    for key, pattern in (("id", r"[0-9a-f]{24}"), ("version", r"[0-9]{1,4}(?:\.[0-9]{1,4}){2}")):
+        value = record.get(key)
+        if isinstance(value, str) and re.fullmatch(pattern, value):
+            receipt[key] = value
+    for key in ("started_at", "finished_at"):
+        value = record.get(key)
+        if type(value) in (int, float) and 0 <= value <= 253402300799:
+            receipt[key] = int(value)
+    return receipt
 
 
 class PanelUpdater:
@@ -27,13 +54,41 @@ class PanelUpdater:
         r = read_json(self.journal)
         return {k: v for k, v in r.items() if k not in {"token", "files", "before_config", "before_manifest"}}
 
+    def public_status(self, transaction=None):
+        if transaction is not None and not re.fullmatch(r"[0-9a-f]{24}", transaction):
+            return {}
+        record = read_json(self.journal)
+        if transaction is None or record.get("id") == transaction:
+            return public_receipt(record)
+        job = read_json(self.state / "jobs" / (transaction + ".json"))
+        if job.get("id") != transaction or "panel_update_version" not in job:
+            return {}
+        archived = job.get("panel_update_receipt", {})
+        if archived.get("id") == transaction:
+            return public_receipt(archived)
+        state = {"running": "preparing", "error": "error", "interrupted": "error"}.get(job.get("state"))
+        if job.get("state") == "done" and job.get("result", {}).get("changed") is False:
+            state = "done"
+        return public_receipt({**job, "version": job["panel_update_version"], "state": state})
+
+    def archive_previous_receipt(self):
+        # Jobs already have bounded retention. Keep a finished receipt there before reusing the journal.
+        receipt = public_receipt(read_json(self.journal))
+        if receipt.get("state") not in {"done", "error", "rolled_back"} or "id" not in receipt:
+            return
+        path = self.state / "jobs" / (receipt["id"] + ".json")
+        job = read_json(path)
+        if job.get("id") == receipt["id"] and "panel_update_version" in job:
+            job["panel_update_receipt"] = receipt
+            write_json(path, job)
+
     def active(self):
         r = read_json(self.journal)
         return r.get("state") in {"prepared", "installing", "checking"}
 
     def recover(self):
         record = read_json(self.journal)
-        if not self.active() or time.time() - record.get("started_at", time.time()) < 60:
+        if record.get("state") not in {"prepared", "installing", "checking"} or time.time() - record.get("started_at", time.time()) < 60:
             return
         pid = record.get("worker_pid")
         try:
@@ -41,9 +96,17 @@ class PanelUpdater:
                 return
         except OSError:
             pass
-        record.update(state="error", message="Процесс обновления прерван. Проверьте версию и службу панели через SSH перед повтором.")
-        record.pop("token", None)
-        write_json(self.journal, record)
+        try:
+            with operation_lock(self.state):
+                # Prepare and the detached worker both hold this lock. Discard stale observations.
+                if read_json(self.journal) != record:
+                    return
+                record.update(state="error", finished_at=int(time.time()), message="Процесс обновления прерван. Проверьте версию и службу панели через SSH перед повтором.")
+                record.pop("token", None)
+                write_json(self.journal, record)
+        except Error as exc:
+            if exc.status != 409:
+                raise
 
     def check(self, fresh=False):
         if not fresh and self.cache and time.time() - self.cache["checked_at"] < 300:
@@ -51,7 +114,7 @@ class PanelUpdater:
         self.cache = release_info()
         return self.cache
 
-    def prepare(self, log, version=None):
+    def prepare(self, log, version=None, transaction=None):
         if self.state.resolve() != pathlib.Path("/opt/etc/tailscale-panel").resolve():
             raise Error("Самообновление доступно только для установленной панели в штатном каталоге")
         if self.active():
@@ -73,10 +136,11 @@ class PanelUpdater:
         for p in (candidate / "panel").glob("*.py"):
             compile(p.read_bytes(), str(p), "exec")
         token = secrets.token_hex(16)
-        record = {"id": secrets.token_hex(12), "token": token, "state": "prepared",
+        record = {"id": transaction or secrets.token_hex(12), "token": token, "state": "prepared",
                   "from_version": VERSION, "version": info["latest"],
                   "files": manifest["files"],
                   "started_at": int(time.time()), "message": "Архив проверен, ожидается перезапуск панели"}
+        self.archive_previous_receipt()
         write_json(self.journal, record)
         try:
             # Worker waits for the HTTP job's operation_lock; never restart from its own request thread.
@@ -88,7 +152,8 @@ class PanelUpdater:
             record["worker_pid"] = worker.pid
             write_json(self.journal, record)
         except Exception:
-            record.update(state="error", message="Не удалось запустить обновление панели")
+            record.update(state="error", finished_at=int(time.time()), message="Не удалось запустить обновление панели")
+            record.pop("token", None)
             write_json(self.journal, record)
             raise
         log("Панель будет перезапущена. Клиент Tailscale продолжит работу. После обновления войдите снова.")
@@ -132,7 +197,7 @@ def apply_staged(state, token, root="/", control=None, probe=None):
     manifest = {str(p.relative_to(candidate)).replace("\\", "/"): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in candidate.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
     if manifest != record.get("files") or (candidate / "VERSION").read_text().strip() != record["version"]:
-        record.update(state="error", message="Подготовленные файлы обновления изменились; установка не начиналась")
+        record.update(state="error", finished_at=int(time.time()), message="Подготовленные файлы обновления изменились; установка не начиналась")
         record.pop("token", None)
         write_json(task.journal, record)
         raise Error("Подготовленные файлы обновления изменились")
@@ -247,7 +312,7 @@ def main():
         task = PanelUpdater(state)
         record = read_json(task.journal)
         if record.get("token") == token:
-            record.update(state="error", message="Обновление не началось; проверьте состояние панели через SSH", error=type(exc).__name__)
+            record.update(state="error", finished_at=int(time.time()), message="Обновление не началось; проверьте состояние панели через SSH", error=type(exc).__name__)
             record.pop("token", None)
             write_json(task.journal, record)
 

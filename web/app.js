@@ -10,7 +10,7 @@ async function api(url,body){
  if(body!==undefined){opt.method='POST';opt.headers={'Content-Type':'application/json','X-CSRF-Token':session.csrf||''};opt.body=JSON.stringify(body)}
  let r;try{r=await fetch(url,opt)}catch(error){if(['AbortError','TimeoutError'].includes(error.name))throw Error('Роутер не ответил вовремя. Проверьте состояние операции перед повтором.');throw Error('Нет связи с панелью. Проверьте подключение к роутеру.')}
  let d;try{d=await r.json()}catch{throw Error('Роутер вернул неполный ответ. Проверьте соединение.')}
- if(!r.ok){if(r.status===401&&!url.endsWith('/login')&&!credentialsBusy&&session.authenticated){session.authenticated=false;void boot()}throw Error(d.error||'Не удалось выполнить запрос')}
+ if(!r.ok){if(r.status===401&&!url.endsWith('/login')&&!credentialsBusy&&session.authenticated){session.authenticated=false;void boot()}const error=Error(d.error||'Не удалось выполнить запрос');error.status=r.status;throw error}
  return d
 }
 function toast(text,bad=false){const p=document.createElement('div');p.className='toast'+(bad?' bad':'');p.textContent=text;$('#toasts').append(p);setTimeout(()=>p.remove(),6500)}
@@ -424,6 +424,7 @@ async function plan(action,params={},revision){
   $('#command-details').hidden=!preview.commands.length;
   $('#confirm-apply').textContent=preview.changes.length?'Применить':'Подтвердить проверку';
   pendingPlan={id:preview.id,savedDraft};
+  if(action==='update_panel')pendingPlan.update={version:preview.version||preview.changes[0].after,transaction:preview.transaction||null};
   $('#confirm').showModal();
  }catch(e){toast(e.message,true)}finally{preparingPlan=false;}
 }
@@ -457,8 +458,9 @@ async function pollJob(job){
   }
   if(j.result?.panel_update){
    activeJob=null;
-   localStorage.setItem('tailscalekeen-update',JSON.stringify({version:j.result.version,at:Date.now()}));
-   watchPanelUpdate();
+   $('#job-dialog').close();
+   if(!panelUpdateTask)rememberUpdate({transaction:j.result.transaction,version:j.result.version,at:Date.now()});
+   openUpdateStatus();
   }else if(j.state==='running')setTimeout(()=>pollJob(job),1200);
   else{
    activeJob=null;
@@ -496,7 +498,7 @@ async function checkUpdate(){
 function showLogin(){session.authenticated=false;$('#app').hidden=true;$('#login-screen').hidden=false}
 let booting=null;
 function boot(){if(booting)return booting;booting=loadSession().finally(()=>{booting=null});return booting}
-async function loadSession(){try{session=await api('/api/session');if(session.authenticated){$('#login-screen').hidden=true;$('#app').hidden=false;data=await api('/api/dashboard');status();await render();const trial=new URLSearchParams(location.hash.slice(1)).get('port-confirm');if(trial)await showPortTrial(trial)}else{showLogin();const first=!session.configured,f=$('#login-form');$('#password-confirm-label').hidden=!first;f.elements.password_confirm.required=first;f.elements.password.minLength=first?6:0;f.elements.password.autocomplete=first?'new-password':'current-password';f.elements.username.autocomplete=first?'off':'username';if(first){f.reset();f.elements.username.value='';f.elements.password.value='';f.elements.password_confirm.value=''}$('#login-title').textContent=first?'Создание учётной записи':'Вход в панель Tailscale';$('#login-description').textContent=first?'Задайте отдельные логин и пароль для TailScaleKeen.':'Войдите в панель управления Tailscale.';$('#login-form button[type=submit]').textContent=first?'Создать учётную запись':'Войти';$('#login-hint').textContent=first?'Задайте логин и дважды введите пароль — от 6 знаков, в том числе только цифры.':'Забыли пароль? В SSH выполните: tailscalekeen reset-password'}}catch(e){showLogin();$('#login-error').textContent=e.message}}
+async function loadSession(){try{session=await api('/api/session');observeLatestUpdate(session.panel_update,session.version);if(session.authenticated){$('#login-screen').hidden=true;$('#app').hidden=false;data=await api('/api/dashboard');status();await render();const trial=new URLSearchParams(location.hash.slice(1)).get('port-confirm');if(trial)await showPortTrial(trial)}else{showLogin();const first=!session.configured,f=$('#login-form');$('#password-confirm-label').hidden=!first;f.elements.password_confirm.required=first;f.elements.password.minLength=first?6:0;f.elements.password.autocomplete=first?'new-password':'current-password';f.elements.username.autocomplete=first?'off':'username';if(first){f.reset();f.elements.username.value='';f.elements.password.value='';f.elements.password_confirm.value=''}$('#login-title').textContent=first?'Создание учётной записи':'Вход в панель Tailscale';$('#login-description').textContent=first?'Задайте отдельные логин и пароль для TailScaleKeen.':'Войдите в панель управления Tailscale.';$('#login-form button[type=submit]').textContent=first?'Создать учётную запись':'Войти';$('#login-hint').textContent=first?'Задайте логин и дважды введите пароль — от 6 знаков, в том числе только цифры.':'Забыли пароль? В SSH выполните: tailscalekeen reset-password'}}catch(e){showLogin();$('#login-error').textContent=e.message}}
 $('#login-form').onsubmit=async e=>{e.preventDefault();const b=$('#login-form button[type=submit]');b.disabled=true;$('#login-error').textContent='';try{const f=e.target;if(!session.configured&&f.elements.password.value!==f.elements.password_confirm.value)throw Error('Пароли не совпадают.');const r=await api(session.configured?'/api/login':'/api/setup',fields(f,session.configured?['username','password']:['username','password','password_confirm']));session={...session,...r,configured:true};f.reset();await boot()}catch(e){$('#login-error').textContent=e.message}finally{b.disabled=false}};
 $('#logout').onclick=async()=>{try{await api('/api/logout',{});$('#appearance').close();await boot()}catch(e){toast(e.message,true)}};
 $('#confirm-apply').onclick=async()=>{
@@ -504,6 +506,13 @@ $('#confirm-apply').onclick=async()=>{
  if(!preview||button.disabled)return;
  button.disabled=true;
  try{
+  if(preview.update){
+   if(panelUpdateTask){$('#confirm').close();openUpdateStatus();return;}
+   pendingPlan=null;
+   $('#confirm').close();
+   await applyPanelUpdate(preview);
+   return;
+  }
   const job=await api('/api/actions/apply',{plan_id:preview.id});
   pendingPlan=null;
   $('#confirm').close();
@@ -581,6 +590,7 @@ $('#port-cancel').onclick=async()=>{try{const result=await api('/api/panel-port/
 $('#port-dialog-close').onclick=()=>$('#port-dialog').close();
 
 async function checkPanelUpdate(){
+ if(panelUpdateTask){openUpdateStatus();return;}
  const button=$('#check-panel-update'),note=$('#panel-update-info');
  button.disabled=true;note.textContent='Проверяю стабильные релизы GitHub…';
  try{
@@ -591,34 +601,194 @@ async function checkPanelUpdate(){
  }catch(error){if(note.isConnected){note.textContent=error.message;toast(error.message,true);}}
  finally{button.disabled=false;}
 }
-async function loadPanelUpdateStatus(){
- try{const result=await api('/api/panel-update-status');if(result.state&&$('#panel-update-info'))$('#panel-update-info').textContent=result.message;if(['prepared','installing','checking'].includes(result.state)){localStorage.setItem('tailscalekeen-update',JSON.stringify({version:result.version,at:Date.now()}));watchPanelUpdate()}}catch(error){toast(error.message,true)}
+const updateKey='tailscalekeen-update', updateAckKey='tailscalekeen-update-ack';
+const runningUpdateStates=['preparing','prepared','installing','checking'];
+const terminalUpdateStates=['done','rolled_back','error'];
+let panelUpdateTask=null, updateWatcher=null, updateUncertain=false, showUpdateAfterLogin=false;
+try{
+ const saved=JSON.parse(localStorage.getItem(updateKey)||'null');
+ if(saved&&typeof saved.version==='string'&&Number.isFinite(saved.at))panelUpdateTask=saved;
+}catch{localStorage.removeItem(updateKey);}
+
+function rememberUpdate(task){
+ panelUpdateTask=task;
+ const {transaction,version,at,job,final,message,installed}=task;
+ localStorage.setItem(updateKey,JSON.stringify(final?{transaction,version,at,final,message,installed}:{transaction,version,at,job}));
 }
-let panelUpdateWatching=false;
-async function watchPanelUpdate(){
- if(panelUpdateWatching)return;panelUpdateWatching=true;
- let pending;try{pending=JSON.parse(localStorage.getItem('tailscalekeen-update')||'null')}catch{localStorage.removeItem('tailscalekeen-update')}
- if(!pending||Date.now()-pending.at>600000){localStorage.removeItem('tailscalekeen-update');panelUpdateWatching=false;return}
- const until=Date.now()+120000;
- while(Date.now()<until){
-  if(!activeJob&&$('#job-dialog').open){
-   $('#job-state').textContent='Обновляется панель';
-   $('#job-result').textContent='Дождитесь завершения. Соединение с панелью временно прервётся.';
-  }
-  try{
-   const response=await fetch('/api/session',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(4000)}),value=await response.json(),result=value.panel_update;
-   if(result?.version===pending.version&&['done','rolled_back','error'].includes(result.state)){
-    localStorage.removeItem('tailscalekeen-update');panelUpdateWatching=false;
-    if(!activeJob)$('#job-dialog').close();
-    if(result.state==='done'){
-     if(lanDraft?.changed())toast('Панель обновлена. После сохранения правил перезагрузите страницу.');
-     else location.reload();
-    }else toast(result.message,true);
-    return;
-   }
-  }catch{}
-  await new Promise(resolve=>setTimeout(resolve,1800));
+function describeUpdate(task){
+ const titles={done:'Панель обновлена',rolled_back:'Восстановлена прежняя версия',error:'Обновление не завершено',installed:'Установленная версия подтверждена'};
+ $('#panel-update-heading').textContent=titles[task.final]||(updateUncertain?'Результат пока неизвестен':'Обновление TailScaleKeen');
+ $('#panel-update-message').textContent=task.message||'Роутер готовит обновление. Во время перезапуска связь может прерваться.';
+ $('#panel-update-version').textContent=task.installed?'Установленная версия '+task.installed:'Версия обновления '+task.version;
+ $('#panel-update-retry').hidden=!updateUncertain;
+ const failure=task.transaction&&['error','rolled_back'].includes(task.final);
+ $('#panel-update-details').hidden=!session.authenticated||!failure;
+ $('#panel-update-login').hidden=session.authenticated||!failure;
+ if($('#panel-update-details').hidden){$('#panel-update-detail').hidden=true;$('#panel-update-detail').textContent='';}
+ $('#panel-update-dismiss').textContent=task.final?'Закрыть':updateUncertain?'Завершить проверку':'Скрыть';
+}
+function showUpdateDialog(){
+ if(!panelUpdateTask)return;
+ describeUpdate(panelUpdateTask);
+ const dialog=$('#panel-update-dialog');
+ if(!dialog.open)dialog.showModal();
+}
+function openUpdateStatus(){
+ showUpdateDialog();
+ if(panelUpdateTask&&!panelUpdateTask.final)void watchPanelUpdate();
+}
+function dismissUpdate(){
+ const task=panelUpdateTask;
+ if(task&&(task.final||updateUncertain)){
+  if(task.final&&task.transaction)localStorage.setItem(updateAckKey,task.transaction);
+  localStorage.removeItem(updateKey);panelUpdateTask=null;updateUncertain=false;
  }
- panelUpdateWatching=false;toast('Проверка обновления продолжается. Обновите страницу и войдите снова; результат сохранён в разделе «Клиент и панель».',true)
+ $('#panel-update-dialog').close();
+ $('#panel-update-detail').textContent='';$('#panel-update-detail').hidden=true;
 }
-if(localStorage.getItem('tailscalekeen-update'))watchPanelUpdate();
+$('#panel-update-dismiss').onclick=dismissUpdate;
+window.addEventListener('storage',event=>{
+ if(event.key===updateAckKey&&event.newValue&&panelUpdateTask?.transaction===event.newValue){
+  panelUpdateTask=null;updateUncertain=false;$('#panel-update-dialog').close();
+ }
+});
+$('#panel-update-dialog').addEventListener('cancel',event=>{event.preventDefault();dismissUpdate();});
+$('#panel-update-retry').onclick=()=>{if(panelUpdateTask&&!updateWatcher)void watchPanelUpdate();};
+$('#panel-update-login').onclick=()=>{
+ showUpdateAfterLogin=true;$('#panel-update-dialog').close();void boot();
+};
+$('#panel-update-details').onclick=async()=>{
+ const task=panelUpdateTask, button=$('#panel-update-details'), output=$('#panel-update-detail');
+ if(!task?.transaction||!session.authenticated)return;
+ button.disabled=true;
+ try{
+  let detail=task.applyError;
+  if(!detail){
+   const job=await updateStatusResponse('/api/jobs/'+encodeURIComponent(task.transaction));
+   if(job?.id===task.transaction&&job.panel_update_version===task.version)detail=job.error;
+  }
+  if(!detail){
+   const journal=await updateStatusResponse('/api/panel-update-status');
+   if(journal?.id===task.transaction&&journal.version===task.version&&journal.state===task.final)detail=journal.message;
+  }
+  if(task===panelUpdateTask&&session.authenticated){
+   output.textContent=detail||'Причина для этой операции не сохранилась в журнале.';
+   output.hidden=false;
+  }
+ }catch{if(task===panelUpdateTask&&session.authenticated){output.textContent='Не удалось загрузить подробности. Проверьте связь и повторите запрос.';output.hidden=false;}}
+ finally{button.disabled=false;}
+};
+
+function finishUpdate(task,state,message,installed,reload=false){
+ if(task!==panelUpdateTask||task.final)return;
+ // The result survives logout. Keep authenticated job errors and journal details out of storage.
+ if(state==='done')message='Роутер подтвердил завершение обновления.';
+ if(state==='error')message='Роутер не завершил обновление. Подробности доступны после входа.';
+ if(state==='rolled_back')message='Роутер восстановил предыдущую версию панели.';
+ Object.assign(task,{final:state,message,installed});
+ updateUncertain=false;
+ rememberUpdate(task);
+ showUpdateDialog();
+ if(reload&&!lanDraft?.changed())location.reload();
+}
+async function applyPanelUpdate(preview){
+ const task={...preview.update,at:Date.now()};
+ rememberUpdate(task);
+ updateUncertain=false;
+ openUpdateStatus();
+ try{
+  const job=await api('/api/actions/apply',{plan_id:preview.id});
+  if(panelUpdateTask===task&&!task.final){task.job=job.id;rememberUpdate(task);}
+ }catch(error){
+  if(panelUpdateTask!==task||task.final)return;
+  if([400,403,404,409,429].includes(error.status)){
+   task.applyError=error.message;
+   finishUpdate(task,'error',error.message,session.version);
+  }else{
+   task.message='Ответ на запрос установки не получен. Проверяем состояние операции на роутере.';
+   describeUpdate(task);
+  }
+ }
+}
+function observeLatestUpdate(result,installed){
+ if(panelUpdateTask?.final)describeUpdate(panelUpdateTask);
+ if(panelUpdateTask?.final&&showUpdateAfterLogin&&session.authenticated){
+  showUpdateAfterLogin=false;showUpdateDialog();
+ }
+ if(panelUpdateTask?.final&&installed&&panelUpdateTask.installed&&installed!==panelUpdateTask.installed){
+  $('#panel-update-version').textContent='Сейчас установлена '+installed+'. После операции — '+panelUpdateTask.installed+'.';
+ }
+ if(panelUpdateTask||location.hash!=='#system'||!result?.id||!result.version||result.id===localStorage.getItem(updateAckKey))return;
+ const finished=terminalUpdateStates.includes(result.state);
+ const timestamp=finished?result.finished_at:result.started_at;
+ const age=Date.now()-Number(timestamp)*1000;
+ if(!Number.isFinite(age)||age < -300000||age>86400000)return;
+ if(!finished&&!runningUpdateStates.includes(result.state))return;
+ if(result.state==='done'&&result.version!==installed)return;
+ const task={transaction:result.id,version:result.version,at:Date.now()};
+ rememberUpdate(task);
+ if(finished){
+  finishUpdate(task,result.state,result.message,installed);
+ }else openUpdateStatus();
+}
+async function loadPanelUpdateStatus(){
+ try{
+  const result=await api('/api/panel-update-status');
+  const note=$('#panel-update-info');
+  if(note&&result.state)note.textContent='Последняя операция — '+(result.message||result.state).replace(/[.!]$/,'')+'. Установленная версия '+data.panel_version+'.';
+  observeLatestUpdate(result,data.panel_version);
+ }catch(error){if($('#panel-update-info'))toast(error.message,true);}
+}
+async function updateStatusResponse(url){
+ const response=await fetch(url,{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(5000)});
+ if(!response.ok)return null;
+ return response.json();
+}
+async function watchPanelUpdate(){
+ const task=panelUpdateTask;
+ if(!task||task.final||updateWatcher)return;
+ updateWatcher=task;
+ updateUncertain=false;
+ const until=Date.now()+180000;
+ try{
+  do{
+   try{
+    if(booting)await booting;
+    const url='/api/session'+(task.transaction?'?update_id='+encodeURIComponent(task.transaction):'');
+    const current=await updateStatusResponse(url);
+    if(task!==panelUpdateTask||task.final)return;
+    if(!current?.version)throw Error();
+    task.installed=current.version;
+    let result=current.panel_update||{};
+    // Rollback may restore a build that lacks a transaction id on the public endpoint.
+    if(!result.id&&result.state&&result.version===task.version&&current.authenticated){
+     result=await updateStatusResponse('/api/panel-update-status')||result;
+    }
+    if(task!==panelUpdateTask||task.final)return;
+    if(!task.transaction&&task.job&&task.job===result.id){task.transaction=result.id;rememberUpdate(task);}
+    if(task.transaction&&result.id===task.transaction&&result.version===task.version){
+     if(terminalUpdateStates.includes(result.state)&&(result.state!=='done'||current.version===task.version)){
+      finishUpdate(task,result.state,result.message,current.version,result.state==='done');
+      return;
+     }
+     task.message=result.state==='done'?'Роутер завершил операцию. Проверяем запущенную версию.':result.message;
+    }else if(!task.transaction&&current.version===task.version){
+     // Old clients saved just a target version. Only the running version can be confirmed.
+     if(result.version===task.version&&result.id)task.transaction=result.id;
+     finishUpdate(task,'installed','Роутер отвечает на запрошенной версии панели.',current.version,true);
+     return;
+    }else{
+     task.message=!current.authenticated&&result.state&&!result.id?'Войдите в панель, чтобы проверить результат обновления прежней версии.':
+      'Ожидаем подтверждения операции от роутера.';
+    }
+   }catch{if(task===panelUpdateTask&&!task.final)task.message='Ожидаем восстановления связи с панелью.';}
+   if(task!==panelUpdateTask||task.final)return;
+   describeUpdate(task);
+   await new Promise(resolve=>setTimeout(resolve,1800));
+  }while(Date.now()<until);
+  updateUncertain=true;
+  task.message='Роутер пока не подтвердил результат. Кнопка ниже повторяет только проверку состояния.';
+  showUpdateDialog();
+ }finally{if(updateWatcher===task)updateWatcher=null;}
+}
+if(panelUpdateTask)openUpdateStatus();

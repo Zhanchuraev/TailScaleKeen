@@ -3,7 +3,7 @@
 from __future__ import annotations
 import contextlib, hashlib, ipaddress, json, os, pathlib, re, secrets, shlex, subprocess, threading, time, urllib.parse, urllib.request
 
-VERSION = "1.1.7"
+VERSION = "1.1.8"
 PREF_KEYS = (
     "ControlURL",
     "RouteAll",
@@ -386,12 +386,14 @@ class Jobs:
             raise Error("Задание не найдено", 404)
         return read_json(p)
 
-    def start(self, label, fn):
+    def start(self, label, fn, *, job_id=None, update_version=None):
         if not self.lock.acquire(False):
             raise Error("Другая операция ещё выполняется", 409)
         try:
             self.prune()
-            jid = secrets.token_hex(12)
+            jid = job_id if job_id is not None else secrets.token_hex(12)
+            if not re.fullmatch(r"[0-9a-f]{24}", jid):
+                raise Error("Неверный идентификатор операции")
             p = self.path / (jid + ".json")
             record = {
                 "id": jid,
@@ -400,6 +402,8 @@ class Jobs:
                 "started_at": time.time(),
                 "log": [],
             }
+            if update_version is not None:
+                record["panel_update_version"] = update_version
             write_json(p, record)
         except Exception:
             self.lock.release()

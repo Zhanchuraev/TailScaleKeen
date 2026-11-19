@@ -31,6 +31,33 @@ class ReleaseTests(unittest.TestCase):
             PanelUpdater(self.root).prepare(lambda _:None)
         self.assertFalse(fetch.called)
 
+    def test_new_journal_keeps_older_terminal_receipt_for_its_job(self):
+        updater = PanelUpdater(self.root)
+        previous = "a"*24
+        write_json(self.root / "jobs" / (previous + ".json"),
+                   {"id": previous, "panel_update_version": "2.0.0", "state": "done"})
+        write_json(updater.journal, {"id": previous, "state": "rolled_back", "version": "2.0.0",
+                                     "message": "private detail", "error": "internal", "finished_at": 100})
+        updater.archive_previous_receipt()
+        write_json(updater.journal, {"id": "b"*24, "state": "checking", "version": "2.0.0"})
+        receipt = updater.public_status(previous)
+        self.assertEqual((receipt["id"], receipt["state"], receipt["finished_at"]), (previous, "rolled_back", 100))
+        self.assertNotIn("private", str(receipt))
+        self.assertEqual(updater.public_status()["state"], "checking")
+
+    def test_recovery_rechecks_stale_transaction_under_lock(self):
+        from contextlib import contextmanager
+        updater = PanelUpdater(self.root)
+        write_json(updater.journal, {"id": "a"*24, "state": "prepared", "started_at": 1})
+        newer = {"id": "b"*24, "state": "prepared", "started_at": time.time()}
+        @contextmanager
+        def acquire(state):
+            write_json(updater.journal, newer)
+            yield
+        with patch('panel.panel_update.operation_lock', acquire):
+            updater.recover()
+        self.assertEqual(read_json(updater.journal), newer)
+
     def test_valid_archive_and_reproducible_build(self):
         path=build();one=path.read_bytes();self.assertEqual(one,build().read_bytes())
         m=unpack_release(one,self.root/'candidate',VERSION)

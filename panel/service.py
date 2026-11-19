@@ -214,8 +214,9 @@ class Service:
             if not info["available"]:
                 raise Error("Установлена актуальная версия панели")
             pid = secrets.token_hex(16)
-            self.remember_plan(pid, {"action": action, "params": {"version": info["latest"]}, "expires": time.time() + 180})
-            return {"id": pid, "action": action, "changes": [{"name": "TailScaleKeen", "before": VERSION, "after": info["latest"]}],
+            transaction = secrets.token_hex(12)
+            self.remember_plan(pid, {"action": action, "params": {"version": info["latest"]}, "transaction": transaction, "expires": time.time() + 180})
+            return {"id": pid, "transaction": transaction, "version": info["latest"], "action": action, "changes": [{"name": "TailScaleKeen", "before": VERSION, "after": info["latest"]}],
                     "commands": [], "message": "Код панели будет загружен из официального репозитория проекта и проверен. Панель перезапустится; войдите снова. Клиент Tailscale и его настройки сохранятся.", "expires_in": 180}
         changes = []
         commands = []
@@ -410,7 +411,7 @@ class Service:
             self.event("action_started", {"action": action})
             policies = self.native.linked_policies() if action in {"settings", "restore", "restart"} else []
             if action == "update_panel":
-                result = self.panel_updater.prepare(log, params["version"])
+                result = self.panel_updater.prepare(log, params["version"], plan["transaction"])
             elif action == "lan_access":
                 if self.lan_access.current() != plan.get("lan_revision"):
                     raise Error("Список доступа изменился. Обновите предпросмотр.", 409)
@@ -479,6 +480,7 @@ class Service:
                 "restore": "Восстановление настроек",
             }[action],
             work,
+            **({"job_id": plan["transaction"], "update_version": params["version"]} if action == "update_panel" else {}),
         )
 
     def local_patch(self, fields):

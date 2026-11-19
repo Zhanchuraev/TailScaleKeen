@@ -239,8 +239,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            path = urllib.parse.urlsplit(self.path).path
-            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            url = urllib.parse.urlsplit(self.path)
+            path = url.path
+            query = urllib.parse.parse_qs(url.query, keep_blank_values=path == "/api/session")
             if path in ["/", "/login"]:
                 self.send(
                     200,
@@ -282,7 +283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "csrf": s["csrf"],
                         "configured": bool(self.app.auth_record().get("password_hash")),
                         "version": VERSION,
-                        "panel_update": {k: v for k, v in self.app.service.panel_updater.status().items() if k in {"state", "version", "message"}},
+                        "panel_update": self.app.service.panel_updater.public_status(query.get("update_id", [None])[0]),
                     },
                     cookie=cookie,
                 )
