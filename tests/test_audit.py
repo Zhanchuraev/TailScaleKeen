@@ -166,6 +166,25 @@ class AuditServiceTests(unittest.TestCase):
             self.service.health(); self.service.health()
         self.assertEqual(inspect_.call_count, 1)
 
+    def test_first_setup_permissions_check_private_account_state(self):
+        import stat
+        from types import SimpleNamespace
+        state=self.service.state
+        (state/'auth.json').unlink(missing_ok=True)
+        write_json(state/'account-state.json',{'generation':'fixture'})
+        write_json(state/'config.json',{})
+        original=pathlib.Path.lstat
+        for mode,expected in [(0o600,'ok'),(0o644,'warn')]:
+            def permissions(path,*args,**kwargs):
+                if path==state:return SimpleNamespace(st_mode=stat.S_IFDIR|0o700)
+                if path==state/'config.json':return SimpleNamespace(st_mode=stat.S_IFREG|0o600)
+                if path==state/'account-state.json':return SimpleNamespace(st_mode=stat.S_IFREG|mode)
+                return original(path,*args,**kwargs)
+            with self.subTest(mode=mode),patch.object(pathlib.Path,'lstat',permissions):
+                result=inspect(self.service,root=self.tmp.name)
+            checks={x['id']:x['state'] for x in result['checks']}
+            self.assertEqual(checks['permissions'],expected);self.assertEqual(checks['account'],'warn')
+
 
 class JobStorageTests(unittest.TestCase):
     def setUp(self):

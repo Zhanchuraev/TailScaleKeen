@@ -245,6 +245,8 @@ def apply_staged(state, token, root="/", control=None, probe=None):
             p = state / name
             if (p.read_bytes() if p.exists() else None) != before[name]:
                 raise Error("Учётная запись изменилась во время обновления")
+        from .legacy_policy import migrate
+        record["legacy_integration"] = migrate(state, root)
         record.update(state="done", message="Панель обновлена, настройки и клиент сохранены", finished_at=int(time.time()))
     except Exception as exc:
         if stopped:

@@ -44,10 +44,14 @@ def inspect(service, root="/"):
     tun = service.native.tun
     tun_exists = bool(re.fullmatch(r"opkgtun(?:[0-9]|1[0-5])", tun)) and (root / "sys/class/net" / tun).is_dir()
     add("tun", "Сетевой интерфейс", tun_exists, "Интерфейс клиента существует", "Интерфейс клиента пока не создан")
-    add("account", "Учётная запись панели", bool(read_json(service.state / "auth.json").get("password_hash")),
+    account_configured = bool(read_json(service.state / "auth.json").get("password_hash"))
+    add("account", "Учётная запись панели", account_configured,
         "Настроена отдельная учётная запись", "Первоначальная настройка ещё не завершена")
     secure = True
-    for path in [service.state, service.state / "auth.json", service.state / "config.json"]:
+    account_file = service.state / "auth.json"
+    if not account_file.exists() and not account_configured:
+        account_file = service.state / "account-state.json"
+    for path in [service.state, account_file, service.state / "config.json"]:
         try:
             mode = path.lstat().st_mode
             secure = secure and not stat.S_ISLNK(mode) and not mode & 0o077

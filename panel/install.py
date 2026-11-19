@@ -339,6 +339,10 @@ def _install(
     manifest["client"] = client_result
     manifest["version"] = VERSION
     write_json(state / "manifest.json", manifest)
+    from .legacy_policy import migrate
+    legacy = migrate(state, root, live=not no_start)
+    if legacy["state"] == "needs_review":
+        print("Старая интеграция требует проверки через SSH; настройки сохранены.", flush=True)
     if root == "/" and not no_start:
         subprocess.run(
             ["/opt/etc/init.d/S98tailscale-panel", "start"], timeout=35, check=True
@@ -352,6 +356,7 @@ def _install(
                 "client": client_result,
                 "auth_source": "local",
                 "root": root,
+                "legacy_integration": legacy,
             }
         ),
         flush=True,
